@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+backend/keys/
+*.key
+*.pem
+.DS_Store
+coverage/
+.sonarqube/
+backend/test.http

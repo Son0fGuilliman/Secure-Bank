@@ -1,0 +1,99 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  nasabah
+  admin
+}
+
+enum UserStatus {
+  aktif
+  suspend
+}
+
+enum TxStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+model User {
+  id            String     @id @default(uuid())
+  nik           String     @unique @db.VarChar(16)
+  nama          String     @db.VarChar(100)
+  email         String     @unique @db.VarChar(100)
+  nomor_hp      String?    @db.VarChar(15)
+  password_hash String
+  role          Role       @default(nasabah)
+  status        UserStatus @default(aktif)
+  created_at    DateTime   @default(now())
+
+  accounts   Account[]
+  audit_logs AuditLog[]
+
+  @@map("users")
+}
+
+model Account {
+  id             String   @id @default(uuid())
+  user_id        String
+  nomor_rekening String   @unique @db.VarChar(20)
+  saldo          Decimal  @default(0) @db.Decimal(19, 2)
+  tipe_akun      String   @default("tabungan") @db.VarChar(30)
+  status         String   @default("aktif") @db.VarChar(10)
+  created_at     DateTime @default(now())
+
+  user              User          @relation(fields: [user_id], references: [id])
+  transactions_from Transaction[] @relation("FromAccount")
+  transactions_to   Transaction[] @relation("ToAccount")
+
+  @@map("accounts")
+}
+
+model Transaction {
+  id              String   @id @default(uuid())
+  dari_rekening   String
+  ke_rekening     String
+  nominal         Decimal  @db.Decimal(19, 2)
+  status          TxStatus @default(PENDING)
+  keterangan      String?  @db.Text
+  blockchain_hash String?  @db.VarChar(66)
+  waktu           DateTime @default(now())
+
+  from_account      Account           @relation("FromAccount", fields: [dari_rekening], references: [id])
+  to_account        Account           @relation("ToAccount", fields: [ke_rekening], references: [id])
+  blockchain_record BlockchainRecord?
+
+  @@map("transactions")
+}
+
+model BlockchainRecord {
+  id             String    @id @default(uuid())
+  transaction_id String    @unique
+  tx_hash        String    @db.VarChar(66)
+  block_number   Int?
+  confirmed_at   DateTime?
+
+  transaction Transaction @relation(fields: [transaction_id], references: [id])
+
+  @@map("blockchain_records")
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  user_id    String?
+  aksi       String   @db.VarChar(100)
+  ip_address String?  @db.VarChar(45)
+  hasil      String?  @db.VarChar(10)
+  waktu      DateTime @default(now())
+
+  user User? @relation(fields: [user_id], references: [id])
+
+  @@map("audit_logs")
+}

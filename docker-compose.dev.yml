@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: securebank_postgres
+    environment:
+      POSTGRES_DB: securebank
+      POSTGRES_USER: securebank
+      POSTGRES_PASSWORD: securebank123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - securebank-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U securebank"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  
+  redis:
+    image: redis:7-alpine
+    container_name: securebank_redis
+    command: redis-server --requirepass redis123
+    ports:
+      - "6379:6379"
+    networks:
+      - securebank-net
+    
+networks:
+  securebank-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
