@@ -8,3 +8,11 @@ backend/keys/
 coverage/
 .sonarqube/
 backend/test.http
+
+# Production & CI artifacts
+zap-reports/
+audit-*.json
+*.log
+
+# Docker
+docker/grafana/provisioning/dashboards/

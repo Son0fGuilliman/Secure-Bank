@@ -1,0 +1,1778 @@
+
+
+--- File: src/hooks/useAuth.ts ---
+
+// Re-export useAuth dari AuthContext untuk kemudahan import
+// Bisa import dari sini: import { useAuth } from '../hooks/useAuth'
+// Atau langsung: import { useAuth } from '../context/AuthContext'
+
+export { useAuth } from '../context/AuthContext';
+
+--- File: src/types/index.ts ---
+
+export interface User {
+    id: string;
+    nama: string;
+    email: string;
+    role: 'nasabah' | 'admin';
+    accounts: Account[];
+}
+
+export interface Account {
+    id: string;
+    nomor_rekening: string;
+    saldo: string | number;
+    tipe_akun?: string;
+    status?: string;
+    nama?: string;
+    email?: string;
+    role?: string;
+    created_at?: string;
+}
+
+export interface Transaction {
+    id: string;
+    tipe: 'debit' | 'kredit';
+    nominal: string | number;
+    status: 'PENDING' | 'COMPLETED' | 'FAILED';
+    keterangan: string | null;
+    nama_pengirim: string;
+    nomor_rekening_pengirim: string;
+    nama_penerima: string;
+    nomor_rekening_penerima: string;
+    blockchain_hash: string | null;
+    blockchain_confirmed: string | null;
+    waktu: string;
+}
+
+export interface Pagination {
+    page: number;
+    limit: number;
+    total: number;
+    total_pages: number;
+}
+
+export interface AuthContextType {
+    user: User | null;
+    accessToken: string | null;
+    login: (token: string, user: User) => void;
+    logout: () => void;
+    isAuthenticated: boolean;
+    isAdmin: boolean;
+}
+
+--- File: src/utils/format.ts ---
+
+export const formatRupiah = (amount: string | number): string => {
+    const num = typeof amount === 'string' ? parseFloat(amount) : amount;
+    return new Intl.NumberFormat('id-ID', {
+        style: 'currency',
+        currency: 'IDR',
+        minimumFractionDigits: 0,
+    }).format(num);
+};
+
+export const formatDate = (dateString: string): string => {
+    return new Intl.DateTimeFormat('id-ID', {
+        day: '2-digit',
+        month: 'long',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        timeZone: 'Asia/Jakarta',
+    }).format(new Date(dateString));
+};
+
+export const formatDateShort = (dateString: string): string => {
+    return new Intl.DateTimeFormat('id-ID', {
+        day: '2-digit',
+        month: 'short',
+        year: 'numeric',
+        timeZone: 'Asia/Jakarta',
+    }).format(new Date(dateString));
+};
+
+export const truncateHash = (hash: string | null, chars = 16): string => {
+    if (!hash) return '-';
+    return `${hash.slice(0, chars)}...${hash.slice(-8)}`;
+};
+
+--- File: src/api/account.api.ts ---
+
+import apiClient from './client';
+
+export const accountApi = {
+    getMyAccount: () => apiClient.get('/accounts/me'),
+
+    getAllUsers: () => apiClient.get('/accounts/admin/users'),
+
+    updateUserStatus: (userId: string, status: 'aktif' | 'suspend') =>
+        apiClient.patch(`/accounts/admin/users/${userId}/status`, { status }),
+};
+
+--- File: src/api/auth.api.ts ---
+
+import apiClient from './client';
+
+export const authApi = {
+    register: (data: {
+        nik: string;
+        nama: string;
+        email: string;
+        nomor_hp?: string;
+        password: string;
+    }) => apiClient.post('/auth/register', data),
+
+    login: (email: string, password: string) =>
+        apiClient.post('/auth/login', { email, password }),
+
+    verifyOtp: (email: string, otp: string) =>
+        apiClient.post('/auth/verify-otp', { email, otp }),
+};
+
+--- File: src/api/client.ts ---
+
+import axios from 'axios';
+
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3000/api/v1';
+
+const apiClient = axios.create({
+    baseURL: API_BASE,
+    headers: { 'Content-Type': 'application/json' },
+    timeout: 30000,
+});
+
+// Attach token dari memory ke setiap request
+apiClient.interceptors.request.use((config) => {
+    const token = window.__accessToken;
+    if (token) {
+        config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+});
+
+// Global error handler
+apiClient.interceptors.response.use(
+    (response) => response,
+    (error) => {
+        //Jangan redirect kalau ini endpoint auth (login/OTP flow)
+        //401 dari verify-otp = OTP salah, bukan token expired
+        const isAuthEndpoint = error.config?.url?.includes('/auth/');
+
+        if (error.response?.status === 401 && !isAuthEndpoint) {
+            // Token expired — clear dan redirect ke login
+            window.__accessToken = undefined;
+            sessionStorage.removeItem('sb_token');
+            sessionStorage.removeItem('sb_user');
+            window.location.href = '/login';
+        }
+        return Promise.reject(error);
+    }
+);
+
+// Simpan token di memory (bukan localStorage — lebih aman dari XSS)
+declare global {
+    interface Window {
+        __accessToken?: string;
+    }
+}
+
+export const setToken = (token: string) => {
+    window.__accessToken = token;
+    //backup ke sessionStorage agar token tetap ada walaupun user refresh page (tapi hilang kalau tab ditutup)
+    sessionStorage.setItem('sb_token', token);
+};
+
+export const clearToken = () => {
+    window.__accessToken = undefined;
+    sessionStorage.removeItem('sb_token');
+    sessionStorage.removeItem('sb_user');
+};
+
+export default apiClient;
+
+--- File: src/api/transaction.api.ts ---
+
+import apiClient from './client';
+
+export const transactionApi = {
+    transfer: (data: {
+        nomor_rekening_tujuan: string;
+        nominal: number;
+        keterangan?: string;
+    }) => apiClient.post('/transactions/transfer', data),
+
+    getHistory: (page = 1, limit = 10) =>
+        apiClient.get(`/transactions/history?page=${page}&limit=${limit}`),
+};
+
+--- File: src/App.tsx ---
+
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { Toaster } from 'react-hot-toast';
+import { AuthProvider } from './context/AuthContext';
+import { ProtectedRoute } from './components/layout/ProtectedRoute';
+import { DashboardLayout } from './components/layout/DashboardLayout';
+
+import { LoginPage } from './pages/LoginPage';
+import { RegisterPage } from './pages/RegisterPage';
+import { DashboardPage } from './pages/DashboardPage';
+import { TransferPage } from './pages/TransferPage';
+import { HistoryPage } from './pages/HistoryPage';
+import { ProfilePage } from './pages/ProfilePage';
+import { AdminPage } from './pages/AdminPage';
+import { NotFoundPage } from './pages/NotFoundPage';
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <BrowserRouter>
+        <Toaster
+          position="bottom-center"
+          toastOptions={{
+            duration: 4000,
+            style: { zIndex: 99999 },
+          }}
+        />
+        <Routes>
+          {/* Public */}
+          <Route path="/login" element={<LoginPage />} />
+          <Route path="/register" element={<RegisterPage />} />
+          <Route path="/" element={<Navigate to="/dashboard" replace />} />
+
+          {/* Protected — semua user */}
+          <Route path="/dashboard" element={
+            <ProtectedRoute>
+              <DashboardLayout><DashboardPage /></DashboardLayout>
+            </ProtectedRoute>
+          } />
+          <Route path="/transfer" element={
+            <ProtectedRoute>
+              <DashboardLayout><TransferPage /></DashboardLayout>
+            </ProtectedRoute>
+          } />
+          <Route path="/history" element={
+            <ProtectedRoute>
+              <DashboardLayout><HistoryPage /></DashboardLayout>
+            </ProtectedRoute>
+          } />
+          <Route path="/profile" element={
+            <ProtectedRoute>
+              <DashboardLayout><ProfilePage /></DashboardLayout>
+            </ProtectedRoute>
+          } />
+
+          {/* Admin only */}
+          <Route path="/admin" element={
+            <ProtectedRoute adminOnly>
+              <DashboardLayout><AdminPage /></DashboardLayout>
+            </ProtectedRoute>
+          } />
+
+          {/* 404 */}
+          <Route path="*" element={<NotFoundPage />} />
+        </Routes>
+      </BrowserRouter>
+    </AuthProvider>
+  );
+}
+
+--- File: src/context/AuthContext.tsx ---
+
+import { createContext, useContext, useState, useEffect, type ReactNode } from 'react';
+import type { User, AuthContextType } from '../types';
+import { setToken, clearToken } from '../api/client';
+
+const AuthContext = createContext<AuthContextType | null>(null);
+
+export const AuthProvider = ({ children }: { children: ReactNode }) => {
+    const [user, setUser] = useState<User | null>(null);
+    const [accessToken, setAccessToken] = useState<string | null>(null);
+    const [loading, setLoading] = useState(true);
+
+    // Restore session saat page refresh
+    useEffect(() => {
+        const savedToken = sessionStorage.getItem('sb_token');
+        const savedUser = sessionStorage.getItem('sb_user');
+
+        if (savedToken && savedUser) {
+            try {
+                const parsedUser = JSON.parse(savedUser) as User;
+                window.__accessToken = savedToken;
+                setAccessToken(savedToken);
+                setUser(parsedUser);
+            } catch {
+                sessionStorage.removeItem('sb_token');
+                sessionStorage.removeItem('sb_user');
+            }
+        }
+        setLoading(false);
+    }, []);
+
+    const login = (token: string, userData: User) => {
+        setToken(token);
+        setAccessToken(token);
+        setUser(userData);
+        // Simpan user ke sessionStorage juga
+        sessionStorage.setItem('sb_user', JSON.stringify(userData));
+    };
+
+    const logout = () => {
+        clearToken();
+        setAccessToken(null);
+        setUser(null);
+    };
+
+    // Tampilkan loading dulu sebelum cek session — mencegah flash redirect ke /login
+    if (loading) {
+        return (
+            <div className="min-h-screen flex items-center justify-center bg-gray-50">
+                <div className="flex flex-col items-center gap-3">
+                    <svg className="animate-spin h-8 w-8 text-blue-600" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+                    </svg>
+                    <p className="text-sm text-gray-400">Memuat sesi...</p>
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <AuthContext.Provider value={{
+            user,
+            accessToken,
+            login,
+            logout,
+            isAuthenticated: !!accessToken,
+            isAdmin: user?.role === 'admin',
+        }}>
+            {children}
+        </AuthContext.Provider>
+    );
+};
+
+export const useAuth = () => {
+    const ctx = useContext(AuthContext);
+    if (!ctx) throw new Error('useAuth harus dipakai di dalam AuthProvider');
+    return ctx;
+};
+
+--- File: src/components/layout/Sidebar.tsx ---
+
+import { NavLink, useNavigate } from 'react-router-dom';
+import { useAuth } from '../../context/AuthContext';
+import {
+    LayoutDashboard, ArrowLeftRight, History,
+    User, Shield, LogOut
+} from 'lucide-react';
+
+const navItems = [
+    { to: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
+    { to: '/transfer', icon: ArrowLeftRight, label: 'Transfer' },
+    { to: '/history', icon: History, label: 'Riwayat' },
+    { to: '/profile', icon: User, label: 'Profil' },
+];
+
+export const Sidebar = () => {
+    const { user, logout, isAdmin } = useAuth();
+    const navigate = useNavigate();
+
+    const handleLogout = () => {
+        logout();
+        navigate('/login');
+    };
+
+    return (
+        <aside className="w-64 bg-slate-900 text-white flex flex-col h-screen fixed left-0 top-0">
+            {/* Logo */}
+            <div className="px-6 py-5 border-b border-slate-700">
+                <h1 className="text-xl font-bold text-white">SecureBank</h1>
+                <p className="text-xs text-slate-400 mt-0.5">Perbankan + Blockchain</p>
+            </div>
+
+            {/* User info */}
+            <div className="px-6 py-4 border-b border-slate-700">
+                <p className="text-sm font-medium text-white">{user?.nama}</p>
+                <p className="text-xs text-slate-400">{user?.email}</p>
+                <span className={`
+          inline-flex mt-1 px-2 py-0.5 rounded-full text-xs font-medium
+          ${isAdmin ? 'bg-orange-900 text-orange-300' : 'bg-blue-900 text-blue-300'}
+        `}>
+                    {isAdmin ? 'Admin' : 'Nasabah'}
+                </span>
+            </div>
+
+            {/* Navigation */}
+            <nav className="flex-1 px-3 py-4 space-y-1">
+                {navItems.map(({ to, icon: Icon, label }) => (
+                    <NavLink
+                        key={to}
+                        to={to}
+                        className={({ isActive }) => `
+              flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-colors
+              ${isActive
+                                ? 'bg-blue-600 text-white font-medium'
+                                : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+                            }
+            `}
+                    >
+                        <Icon className="h-4 w-4 shrink-0" />
+                        {label}
+                    </NavLink>
+                ))}
+
+                {isAdmin && (
+                    <NavLink
+                        to="/admin"
+                        className={({ isActive }) => `
+              flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-colors
+              ${isActive
+                                ? 'bg-orange-600 text-white font-medium'
+                                : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+                            }
+            `}
+                    >
+                        <Shield className="h-4 w-4 shrink-0" />
+                        Admin Panel
+                    </NavLink>
+                )}
+            </nav>
+
+            {/* Logout */}
+            <div className="px-3 py-4 border-t border-slate-700">
+                <button
+                    onClick={handleLogout}
+                    className="flex items-center gap-3 w-full px-3 py-2.5 rounded-lg text-sm text-slate-300 hover:bg-slate-800 hover:text-white transition-colors"
+                >
+                    <LogOut className="h-4 w-4" />
+                    Keluar
+                </button>
+            </div>
+        </aside>
+    );
+};
+
+--- File: src/components/layout/ProtectedRoute.tsx ---
+
+import { Navigate } from 'react-router-dom';
+import { useAuth } from '../../context/AuthContext';
+
+interface ProtectedRouteProps {
+    children: React.ReactNode;
+    adminOnly?: boolean;
+}
+
+export const ProtectedRoute = ({ children, adminOnly = false }: ProtectedRouteProps) => {
+    const { isAuthenticated, isAdmin } = useAuth();
+
+    if (!isAuthenticated) return <Navigate to="/login" replace />;
+    if (adminOnly && !isAdmin) return <Navigate to="/dashboard" replace />;
+
+    return <>{children}</>;
+};
+
+--- File: src/components/layout/Navbar.tsx ---
+
+// Navbar tidak digunakan di layout utama.
+// Layout utama menggunakan Sidebar (src/components/layout/Sidebar.tsx)
+// File ini disediakan untuk kebutuhan masa depan jika diperlukan top navigation.
+
+export const Navbar = () => null;
+
+--- File: src/components/layout/DashboardLayout.tsx ---
+
+import { type ReactNode } from 'react';
+import { Sidebar } from './Sidebar';
+
+export const DashboardLayout = ({ children }: { children: ReactNode }) => (
+    <div className="flex min-h-screen bg-gray-50">
+        <Sidebar />
+        <main className="ml-64 flex-1 p-8">
+            {children}
+        </main>
+    </div>
+);
+
+--- File: src/components/ui/Badge.tsx ---
+
+import { type ReactNode } from 'react';
+
+interface BadgeProps {
+    children: ReactNode;
+    variant?: 'success' | 'danger' | 'warning' | 'info' | 'default';
+}
+
+const variants = {
+    success: 'bg-green-100 text-green-800',
+    danger: 'bg-red-100 text-red-800',
+    warning: 'bg-yellow-100 text-yellow-800',
+    info: 'bg-blue-100 text-blue-800',
+    default: 'bg-gray-100 text-gray-700',
+};
+
+export const Badge = ({ children, variant = 'default' }: BadgeProps) => (
+    <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${variants[variant]}`}>
+        {children}
+    </span>
+);
+
+--- File: src/components/ui/Card.tsx ---
+
+import { type ReactNode } from 'react';
+
+interface CardProps {
+    children: ReactNode;
+    className?: string;
+    title?: string;
+}
+
+export const Card = ({ children, className = '', title }: CardProps) => (
+    <div className={`bg-white rounded-xl border border-gray-200 shadow-sm ${className}`}>
+        {title && (
+            <div className="px-6 py-4 border-b border-gray-100">
+                <h3 className="font-semibold text-gray-900">{title}</h3>
+            </div>
+        )}
+        <div className="p-6">{children}</div>
+    </div>
+);
+
+--- File: src/components/ui/Input.tsx ---
+
+import { type InputHTMLAttributes, forwardRef } from 'react';
+
+interface InputProps extends InputHTMLAttributes<HTMLInputElement> {
+    label?: string;
+    error?: string;
+}
+
+export const Input = forwardRef<HTMLInputElement, InputProps>(
+    ({ label, error, className = '', ...props }, ref) => (
+        <div className="flex flex-col gap-1">
+            {label && (
+                <label className="text-sm font-medium text-gray-700">{label}</label>
+            )}
+            <input
+                ref={ref}
+                className={`
+          w-full px-3 py-2 border rounded-lg text-sm
+          focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent
+          disabled:bg-gray-50 disabled:text-gray-500
+          ${error ? 'border-red-400' : 'border-gray-300'}
+          ${className}
+        `}
+                {...props}
+            />
+            {error && <p className="text-xs text-red-600">{error}</p>}
+        </div>
+    )
+);
+Input.displayName = 'Input';
+
+--- File: src/components/ui/Button.tsx ---
+
+import { type ButtonHTMLAttributes } from "react";
+
+interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+    variant?: "primary" | "secondary" | "danger" | "ghost";
+    size?: "sm" | "md" | "lg";
+    loading?: boolean;
+}
+
+const variants = {
+    primary: 'bg-blue-600 hover:bg-blue-700 text-white',
+    secondary: 'bg-gray-100 hover:bg-gray-200 text-gray-800',
+    danger: 'bg-red-600 hover:bg-red-700 text-white',
+    ghost: 'hover:bg-gray-100 text-gray-700',
+};
+
+const sizes = {
+    sm: 'px-3 py-1.5 text-sm',
+    md: 'px-4 py-2 text-base',
+    lg: 'px-6 py-3 text-lg',
+};
+
+export const Button = ({
+    variant = 'primary',
+    size = 'md',
+    loading = false,
+    disabled,
+    children,
+    className = '',
+    ...props
+}: ButtonProps) => (
+    <button
+        disabled={disabled || loading}
+        className={`
+      inline-flex items-center justify-center gap-2
+      font-medium rounded-lg transition-colors
+      disabled:opacity-50 disabled:cursor-not-allowed
+      ${variants[variant]} ${sizes[size]} ${className}
+    `}
+        {...props}
+    >
+        {loading && (
+            <svg className="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+            </svg>
+        )}
+        {children}
+    </button>
+);
+
+--- File: src/components/ui/LoadingSpinner.tsx ---
+
+export const LoadingSpinner = ({ text = 'Memuat...' }: { text?: string }) => (
+    <div className="flex flex-col items-center justify-center py-16 gap-3">
+        <svg className="animate-spin h-8 w-8 text-blue-600" fill="none" viewBox="0 0 24 24">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+        </svg>
+        <p className="text-sm text-gray-500">{text}</p>
+    </div>
+);
+
+--- File: src/main.tsx ---
+
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import './index.css'
+import App from './App.tsx'
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+
+
+--- File: src/pages/NotFoundPage.tsx ---
+
+import { Link } from 'react-router-dom';
+import { Button } from '../components/ui/Button';
+
+export const NotFoundPage = () => (
+    <div className="min-h-screen flex flex-col items-center justify-center gap-4">
+        <h1 className="text-6xl font-bold text-gray-200">404</h1>
+        <p className="text-gray-500">Halaman tidak ditemukan</p>
+        <Link to="/dashboard">
+            <Button>Kembali ke Dashboard</Button>
+        </Link>
+    </div>
+);
+
+--- File: src/pages/ProfilePage.tsx ---
+
+import { useAuth } from '../context/AuthContext';
+import { Card } from '../components/ui/Card';
+import { Badge } from '../components/ui/Badge';
+import { formatRupiah } from '../utils/format';
+import { User, CreditCard, Shield } from 'lucide-react';
+
+export const ProfilePage = () => {
+    const { user } = useAuth();
+    const account = user?.accounts?.[0];
+
+    return (
+        <div className="max-w-2xl space-y-6">
+            <div>
+                <h2 className="text-2xl font-bold text-gray-900">Profil Saya</h2>
+                <p className="text-gray-500 text-sm mt-1">Informasi akun dan rekening kamu</p>
+            </div>
+
+            {/* Informasi Pribadi */}
+            <Card title="Informasi Pribadi">
+                <div className="flex items-start gap-4">
+                    <div className="p-4 bg-blue-100 rounded-full">
+                        <User className="h-8 w-8 text-blue-600" />
+                    </div>
+                    <div className="space-y-3 flex-1">
+                        <div>
+                            <p className="text-xs text-gray-400">Nama Lengkap</p>
+                            <p className="font-semibold text-gray-900">{user?.nama}</p>
+                        </div>
+                        <div>
+                            <p className="text-xs text-gray-400">Email</p>
+                            <p className="font-medium text-gray-700">{user?.email}</p>
+                        </div>
+                        <div>
+                            <p className="text-xs text-gray-400">Role</p>
+                            <Badge variant={user?.role === 'admin' ? 'warning' : 'info'}>
+                                {user?.role ?? 'nasabah'}
+                            </Badge>
+                        </div>
+                    </div>
+                </div>
+            </Card>
+
+            {/* Informasi Rekening */}
+            {account && (
+                <Card title="Informasi Rekening">
+                    <div className="flex items-start gap-4">
+                        <div className="p-4 bg-green-100 rounded-full">
+                            <CreditCard className="h-8 w-8 text-green-600" />
+                        </div>
+                        <div className="space-y-3 flex-1">
+                            <div>
+                                <p className="text-xs text-gray-400">Nomor Rekening</p>
+                                <p className="font-mono font-bold text-gray-900 text-lg">
+                                    {account.nomor_rekening}
+                                </p>
+                            </div>
+                            <div>
+                                <p className="text-xs text-gray-400">Saldo</p>
+                                <p className="font-bold text-blue-600 text-xl">
+                                    {formatRupiah(account.saldo)}
+                                </p>
+                            </div>
+                            <div>
+                                <p className="text-xs text-gray-400">Status Rekening</p>
+                                <Badge variant="success">Aktif</Badge>
+                            </div>
+                        </div>
+                    </div>
+                </Card>
+            )}
+
+            {/* Keamanan */}
+            <Card title="Keamanan Akun">
+                <div className="flex items-center gap-3">
+                    <Shield className="h-5 w-5 text-green-600 shrink-0" />
+                    <div className="flex-1">
+                        <p className="text-sm font-medium text-gray-900">
+                            Multi-Factor Authentication aktif
+                        </p>
+                        <p className="text-xs text-gray-400 mt-0.5">
+                            Setiap login memerlukan kode OTP 6 digit yang dikirim ke email kamu
+                        </p>
+                    </div>
+                    <Badge variant="success">Aktif</Badge>
+                </div>
+            </Card>
+        </div>
+    );
+};
+
+--- File: src/pages/DashboardPage.tsx ---
+
+import { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+import { accountApi } from '../api/account.api';
+import { transactionApi } from '../api/transaction.api';
+import { Card } from '../components/ui/Card';
+import { Badge } from '../components/ui/Badge';
+import { LoadingSpinner } from '../components/ui/LoadingSpinner';
+import { formatRupiah, formatDateShort, truncateHash } from '../utils/format';
+import type { Account, Transaction } from '../types';
+import { ArrowUpRight, ArrowDownLeft, ExternalLink } from 'lucide-react';
+
+export const DashboardPage = () => {
+    const { user } = useAuth();
+    const [account, setAccount] = useState<Account | null>(null);
+    const [transactions, setTransactions] = useState<Transaction[]>([]);
+    const [loading, setLoading] = useState(true);
+
+    useEffect(() => {
+        const fetchData = async () => {
+            try {
+                const [accRes, txRes] = await Promise.all([
+                    accountApi.getMyAccount(),
+                    transactionApi.getHistory(1, 5),
+                ]);
+                setAccount(accRes.data.data);
+                setTransactions(txRes.data.data.data);
+            } catch (err) {
+                console.error(err);
+            } finally {
+                setLoading(false);
+            }
+        };
+        fetchData();
+    }, []);
+
+    if (loading) return <LoadingSpinner text="Memuat dashboard..." />;
+
+    return (
+        <div className="space-y-6">
+            {/* Greeting */}
+            <div>
+                <h2 className="text-2xl font-bold text-gray-900">
+                    Selamat datang, {user?.nama?.split(' ')[0]}! 👋
+                </h2>
+                <p className="text-gray-500 text-sm mt-1">
+                    Ini ringkasan rekening kamu hari ini
+                </p>
+            </div>
+
+            {/* Saldo Card */}
+            <div className="bg-gradient-to-r from-blue-600 to-blue-800 rounded-2xl p-6 text-white">
+                <p className="text-blue-200 text-sm">Saldo Rekening</p>
+                <p className="text-4xl font-bold mt-1">
+                    {account ? formatRupiah(account.saldo) : 'Rp -'}
+                </p>
+                <div className="flex items-center gap-4 mt-4 text-sm text-blue-200">
+                    <span>No. Rek: <strong className="text-white">{account?.nomor_rekening}</strong></span>
+                    <Badge variant="info">
+                        {account?.tipe_akun || 'tabungan'}
+                    </Badge>
+                </div>
+            </div>
+
+            {/* Quick Actions */}
+            <div className="grid grid-cols-2 gap-4">
+                <Link
+                    to="/transfer"
+                    className="flex flex-col items-center gap-2 p-4 bg-white rounded-xl border border-gray-200 hover:border-blue-300 hover:shadow-md transition-all"
+                >
+                    <div className="p-3 bg-blue-100 rounded-full">
+                        <ArrowUpRight className="h-5 w-5 text-blue-600" />
+                    </div>
+                    <span className="text-sm font-medium text-gray-700">Transfer</span>
+                </Link>
+                <Link
+                    to="/history"
+                    className="flex flex-col items-center gap-2 p-4 bg-white rounded-xl border border-gray-200 hover:border-blue-300 hover:shadow-md transition-all"
+                >
+                    <div className="p-3 bg-green-100 rounded-full">
+                        <ArrowDownLeft className="h-5 w-5 text-green-600" />
+                    </div>
+                    <span className="text-sm font-medium text-gray-700">Riwayat</span>
+                </Link>
+            </div>
+
+            {/* Transaksi Terakhir */}
+            <Card title="5 Transaksi Terakhir">
+                {transactions.length === 0 ? (
+                    <p className="text-center text-gray-400 text-sm py-4">
+                        Belum ada transaksi
+                    </p>
+                ) : (
+                    <div className="space-y-3">
+                        {transactions.map((tx) => (
+                            <div key={tx.id} className="flex items-center gap-3 p-3 rounded-lg hover:bg-gray-50">
+                                <div className={`p-2 rounded-full ${tx.tipe === 'debit' ? 'bg-red-100' : 'bg-green-100'}`}>
+                                    {tx.tipe === 'debit'
+                                        ? <ArrowUpRight className="h-4 w-4 text-red-600" />
+                                        : <ArrowDownLeft className="h-4 w-4 text-green-600" />
+                                    }
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                    <p className="text-sm font-medium text-gray-900 truncate">
+                                        {tx.tipe === 'debit' ? `ke ${tx.nama_penerima}` : `dari ${tx.nama_pengirim}`}
+                                    </p>
+                                    <p className="text-xs text-gray-400">{formatDateShort(tx.waktu)}</p>
+                                </div>
+                                <div className="text-right">
+                                    <p className={`text-sm font-semibold ${tx.tipe === 'debit' ? 'text-red-600' : 'text-green-600'}`}>
+                                        {tx.tipe === 'debit' ? '-' : '+'}{formatRupiah(tx.nominal)}
+                                    </p>
+                                    {tx.blockchain_hash && (
+                                        <span className="text-xs text-blue-500 font-mono" title={tx.blockchain_hash}>
+                                            {truncateHash(tx.blockchain_hash, 8)}
+                                        </span>
+                                    )}
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                )}
+                <div className="mt-4 pt-4 border-t border-gray-100">
+                    <Link
+                        to="/history"
+                        className="flex items-center gap-1 text-sm text-blue-600 hover:underline"
+                    >
+                        Lihat semua transaksi <ExternalLink className="h-3 w-3" />
+                    </Link>
+                </div>
+            </Card>
+        </div>
+    );
+};
+
+--- File: src/pages/HistoryPage.tsx ---
+
+import { useState, useEffect } from 'react';
+import { transactionApi } from '../api/transaction.api';
+import { Card } from '../components/ui/Card';
+import { Badge } from '../components/ui/Badge';
+import { LoadingSpinner } from '../components/ui/LoadingSpinner';
+import { Button } from '../components/ui/Button';
+import { formatRupiah, formatDate } from '../utils/format';
+import type { Transaction, Pagination } from '../types';
+import { ArrowUpRight, ArrowDownLeft, Copy, ChevronLeft, ChevronRight } from 'lucide-react';
+import toast from 'react-hot-toast';
+
+export const HistoryPage = () => {
+    const [transactions, setTransactions] = useState<Transaction[]>([]);
+    const [pagination, setPagination] = useState<Pagination | null>(null);
+    const [page, setPage] = useState(1);
+    const [loading, setLoading] = useState(true);
+    const [selected, setSelected] = useState<Transaction | null>(null);
+
+    useEffect(() => {
+        const fetchHistory = async () => {
+            setLoading(true);
+            try {
+                const res = await transactionApi.getHistory(page, 10);
+                setTransactions(res.data.data.data);
+                setPagination(res.data.data.pagination);
+            } catch {
+                toast.error('Gagal memuat riwayat');
+            } finally {
+                setLoading(false);
+            }
+        };
+        fetchHistory();
+    }, [page]);
+
+    if (loading) return <LoadingSpinner />;
+
+    return (
+        <div className="space-y-6">
+            <div>
+                <h2 className="text-2xl font-bold text-gray-900">Riwayat Transaksi</h2>
+                <p className="text-gray-500 text-sm mt-1">
+                    Klik transaksi untuk melihat bukti blockchain
+                </p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                {/* List */}
+                <div className="lg:col-span-2">
+                    <Card>
+                        {transactions.length === 0 ? (
+                            <p className="text-center text-gray-400 py-8">Belum ada transaksi</p>
+                        ) : (
+                            <div className="space-y-2">
+                                {transactions.map((tx) => (
+                                    <div
+                                        key={tx.id}
+                                        onClick={() => setSelected(tx)}
+                                        className={`
+                      flex items-center gap-3 p-3 rounded-lg cursor-pointer transition-colors
+                      ${selected?.id === tx.id ? 'bg-blue-50 border border-blue-200' : 'hover:bg-gray-50'}
+                    `}
+                                    >
+                                        <div className={`p-2 rounded-full shrink-0 ${tx.tipe === 'debit' ? 'bg-red-100' : 'bg-green-100'}`}>
+                                            {tx.tipe === 'debit'
+                                                ? <ArrowUpRight className="h-4 w-4 text-red-600" />
+                                                : <ArrowDownLeft className="h-4 w-4 text-green-600" />
+                                            }
+                                        </div>
+                                        <div className="flex-1 min-w-0">
+                                            <p className="text-sm font-medium text-gray-900 truncate">
+                                                {tx.tipe === 'debit' ? `Transfer ke ${tx.nama_penerima}` : `Dari ${tx.nama_pengirim}`}
+                                            </p>
+                                            <p className="text-xs text-gray-400">{formatDate(tx.waktu)}</p>
+                                        </div>
+                                        <div className="text-right shrink-0">
+                                            <p className={`text-sm font-semibold ${tx.tipe === 'debit' ? 'text-red-600' : 'text-green-600'}`}>
+                                                {tx.tipe === 'debit' ? '-' : '+'}{formatRupiah(tx.nominal)}
+                                            </p>
+                                            <Badge variant={tx.status === 'COMPLETED' ? 'success' : tx.status === 'FAILED' ? 'danger' : 'warning'}>
+                                                {tx.status}
+                                            </Badge>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+
+                        {/* Pagination */}
+                        {pagination && pagination.total_pages > 1 && (
+                            <div className="flex items-center justify-between mt-4 pt-4 border-t border-gray-100">
+                                <p className="text-sm text-gray-500">
+                                    Halaman {pagination.page} dari {pagination.total_pages} ({pagination.total} transaksi)
+                                </p>
+                                <div className="flex gap-2">
+                                    <Button
+                                        variant="secondary"
+                                        size="sm"
+                                        disabled={page === 1}
+                                        onClick={() => setPage(p => p - 1)}
+                                    >
+                                        <ChevronLeft className="h-4 w-4" />
+                                    </Button>
+                                    <Button
+                                        variant="secondary"
+                                        size="sm"
+                                        disabled={page === pagination.total_pages}
+                                        onClick={() => setPage(p => p + 1)}
+                                    >
+                                        <ChevronRight className="h-4 w-4" />
+                                    </Button>
+                                </div>
+                            </div>
+                        )}
+                    </Card>
+                </div>
+
+                {/* Detail Panel */}
+                <div>
+                    {selected ? (
+                        <Card title="Detail Transaksi">
+                            <div className="space-y-3 text-sm">
+                                <div>
+                                    <p className="text-gray-500 text-xs">Jenis</p>
+                                    <p className="font-medium capitalize">{selected.tipe === 'debit' ? '🔴 Transfer Keluar' : '🟢 Transfer Masuk'}</p>
+                                </div>
+                                <div>
+                                    <p className="text-gray-500 text-xs">Nominal</p>
+                                    <p className="font-bold text-lg">{formatRupiah(selected.nominal)}</p>
+                                </div>
+                                <div>
+                                    <p className="text-gray-500 text-xs">Dari</p>
+                                    <p className="font-medium">{selected.nama_pengirim}</p>
+                                    <p className="text-xs text-gray-400 font-mono">{selected.nomor_rekening_pengirim}</p>
+                                </div>
+                                <div>
+                                    <p className="text-gray-500 text-xs">Ke</p>
+                                    <p className="font-medium">{selected.nama_penerima}</p>
+                                    <p className="text-xs text-gray-400 font-mono">{selected.nomor_rekening_penerima}</p>
+                                </div>
+                                {selected.keterangan && (
+                                    <div>
+                                        <p className="text-gray-500 text-xs">Keterangan</p>
+                                        <p className="font-medium">{selected.keterangan}</p>
+                                    </div>
+                                )}
+                                <div>
+                                    <p className="text-gray-500 text-xs">Waktu</p>
+                                    <p className="font-medium">{formatDate(selected.waktu)}</p>
+                                </div>
+                                <div>
+                                    <p className="text-gray-500 text-xs">Status</p>
+                                    <Badge variant={selected.status === 'COMPLETED' ? 'success' : 'danger'}>
+                                        {selected.status}
+                                    </Badge>
+                                </div>
+
+                                {/* Blockchain hash */}
+                                {selected.blockchain_hash && (
+                                    <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
+                                        <p className="text-xs font-semibold text-blue-700 mb-1">🔗 Bukti Blockchain</p>
+                                        <p className="text-xs font-mono text-blue-800 break-all">{selected.blockchain_hash}</p>
+                                        <button
+                                            onClick={() => {
+                                                navigator.clipboard.writeText(selected.blockchain_hash!);
+                                                toast.success('Hash disalin!');
+                                            }}
+                                            className="mt-2 flex items-center gap-1 text-xs text-blue-600 hover:underline"
+                                        >
+                                            <Copy className="h-3 w-3" /> Salin Hash
+                                        </button>
+                                        {selected.blockchain_confirmed && (
+                                            <p className="text-xs text-blue-600 mt-1">
+                                                Dikonfirmasi: {formatDate(selected.blockchain_confirmed)}
+                                            </p>
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+                        </Card>
+                    ) : (
+                        <div className="bg-gray-50 border border-dashed border-gray-300 rounded-xl p-8 text-center text-gray-400 text-sm">
+                            Pilih transaksi untuk melihat detail dan bukti blockchain
+                        </div>
+                    )}
+                </div>
+            </div>
+        </div>
+    );
+};
+
+--- File: src/pages/LoginPage.tsx ---
+
+import { useState } from 'react';
+import { useNavigate, Link } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+import { authApi } from '../api/auth.api';
+import { Button } from '../components/ui/Button';
+import { Input } from '../components/ui/Input';
+import toast from 'react-hot-toast';
+
+type Step = 'login' | 'otp';
+
+export const LoginPage = () => {
+    const navigate = useNavigate();
+    const { login } = useAuth();
+
+    const [step, setStep] = useState<Step>('login');
+    const [email, setEmail] = useState('');
+    const [password, setPassword] = useState('');
+    const [otp, setOtp] = useState('');
+    const [loading, setLoading] = useState(false);
+    const [errorMsg, setErrorMsg] = useState('');
+
+    const handleLogin = async (e: React.FormEvent) => {
+        e.preventDefault();
+        setErrorMsg('');
+        setLoading(true);
+        try {
+            await authApi.login(email, password);
+            toast.success('Kode OTP dikirim ke email kamu!');
+            setStep('otp');
+        } catch (err: any) {
+            const msg = err.response?.data?.message || 'Login gagal. Coba lagi.';
+            setErrorMsg(msg);
+            toast.error(msg);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const handleVerifyOtp = async (e: React.FormEvent) => {
+        e.preventDefault();
+        setErrorMsg('');
+        setLoading(true);
+        try {
+            const res = await authApi.verifyOtp(email, otp);
+            const { accessToken, user } = res.data.data;
+            login(accessToken, user);
+            toast.success(`Selamat datang, ${user.nama}!`);
+            navigate('/dashboard');
+        } catch (err: any) {
+            const msg = err.response?.data?.message || 'OTP salah atau expired.';
+            setErrorMsg(msg);
+            toast.error(msg);
+            // Kalau OTP expired atau percobaan habis → balik ke step login
+            if (
+                msg.toLowerCase().includes('expired') ||
+                msg.toLowerCase().includes('percobaan habis') ||
+                msg.toLowerCase().includes('login ulang')
+            ) {
+                setTimeout(() => {
+                    setStep('login');
+                    setOtp('');
+                    setErrorMsg('');
+                }, 2000);
+            }
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    return (
+        <div className="min-h-screen bg-gradient-to-br from-slate-900 to-blue-900 flex items-center justify-center p-4">
+            <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-8">
+
+                {/* Header */}
+                <div className="text-center mb-8">
+                    <h1 className="text-2xl font-bold text-slate-900">SecureBank</h1>
+                    <p className="text-slate-500 text-sm mt-1">
+                        {step === 'login' ? 'Masuk ke akun kamu' : 'Verifikasi kode OTP'}
+                    </p>
+                </div>
+
+                {/* Step indicator */}
+                <div className="flex gap-2 mb-8">
+                    {(['login', 'otp'] as Step[]).map((s, i) => (
+                        <div key={s} className="flex-1">
+                            <div className={`h-1.5 rounded-full transition-colors ${s === 'login' || step === 'otp' ? 'bg-blue-600' : 'bg-gray-200'
+                                }`} />
+                            <p className="text-xs text-gray-400 mt-1 text-center">
+                                {i + 1}. {s === 'login' ? 'Password' : 'Kode OTP'}
+                            </p>
+                        </div>
+                    ))}
+                </div>
+
+                {/* Error banner */}
+                {errorMsg && (
+                    <div className="mb-4 bg-red-50 border border-red-200 text-red-700 rounded-lg px-4 py-3 text-sm">
+                        {errorMsg}
+                    </div>
+                )}
+
+                {step === 'login' ? (
+                    <form onSubmit={handleLogin} noValidate className="space-y-4">
+                        <Input
+                            label="Email"
+                            type="email"
+                            value={email}
+                            onChange={(e) => setEmail(e.target.value)}
+                            placeholder="email@example.com"
+                            autoComplete="username"
+                            required
+                        />
+                        <Input
+                            label="Password"
+                            type="password"
+                            value={password}
+                            onChange={(e) => setPassword(e.target.value)}
+                            placeholder="Minimal 8 karakter"
+                            autoComplete="current-password"
+                            required
+                        />
+                        {/* Validasi manual agar tidak bergantung HTML5 */}
+                        <Button
+                            type="submit"
+                            loading={loading}
+                            className="w-full mt-2"
+                            size="lg"
+                            onClick={(e) => {
+                                if (!email || !password) {
+                                    e.preventDefault();
+                                    setErrorMsg('Email dan password wajib diisi');
+                                }
+                            }}
+                        >
+                            Lanjut
+                        </Button>
+                    </form>
+                ) : (
+                    <form onSubmit={handleVerifyOtp} noValidate className="space-y-4">
+                        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 text-sm text-blue-800">
+                            Kode OTP 6 digit dikirim ke <strong>{email}</strong>.<br />
+                            Berlaku <strong>5 menit</strong> dan hanya bisa dipakai <strong>sekali</strong>.
+                        </div>
+                        <div>
+                            <label className="text-sm font-medium text-gray-700 block mb-1">
+                                Kode OTP
+                            </label>
+                            <input
+                                type="text"
+                                inputMode="numeric"
+                                value={otp}
+                                onChange={(e) => {
+                                    setErrorMsg('');
+                                    setOtp(e.target.value.replace(/\D/g, '').slice(0, 6));
+                                }}
+                                placeholder="000000"
+                                maxLength={6}
+                                autoComplete="one-time-code"
+                                className="w-full px-3 py-4 border border-gray-300 rounded-lg text-center text-3xl tracking-widest font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            />
+                            <p className="text-xs text-gray-400 mt-1 text-center">
+                                Cek folder Spam jika email tidak masuk
+                            </p>
+                        </div>
+                        <Button
+                            type="submit"
+                            loading={loading}
+                            className="w-full"
+                            size="lg"
+                            disabled={otp.length !== 6}
+                        >
+                            Verifikasi & Masuk
+                        </Button>
+                        <Button
+                            type="button"
+                            variant="ghost"
+                            className="w-full"
+                            onClick={() => { setStep('login'); setOtp(''); setErrorMsg(''); }}
+                        >
+                            ← Kembali & Login Ulang
+                        </Button>
+                    </form>
+                )}
+
+                <p className="text-center text-sm text-gray-500 mt-6">
+                    Belum punya akun?{' '}
+                    <Link to="/register" className="text-blue-600 hover:underline font-medium">
+                        Daftar sekarang
+                    </Link>
+                </p>
+            </div>
+        </div>
+    );
+};
+
+--- File: src/pages/AdminPage.tsx ---
+
+import { useState, useEffect } from 'react';
+import { accountApi } from '../api/account.api';
+import { Card } from '../components/ui/Card';
+import { Button } from '../components/ui/Button';
+import { Badge } from '../components/ui/Badge';
+import { LoadingSpinner } from '../components/ui/LoadingSpinner';
+import { formatRupiah } from '../utils/format';
+import toast from 'react-hot-toast';
+import { Users, Search } from 'lucide-react';
+
+interface AdminUser {
+    id: string;
+    nik: string;
+    nama: string;
+    email: string;
+    nomor_hp: string | null;
+    role: string;
+    status: string;
+    created_at: string;
+    accounts: { nomor_rekening: string; saldo: string; status: string }[];
+}
+
+export const AdminPage = () => {
+    const [users, setUsers] = useState<AdminUser[]>([]);
+    const [loading, setLoading] = useState(true);
+    const [actionLoading, setActionLoading] = useState<string | null>(null);
+    const [search, setSearch] = useState('');
+
+    const fetchUsers = async () => {
+        try {
+            const res = await accountApi.getAllUsers();
+            setUsers(res.data.data);
+        } catch {
+            toast.error('Gagal memuat data user');
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    useEffect(() => { fetchUsers(); }, []);
+
+    const handleToggleStatus = async (userId: string, currentStatus: string) => {
+        const newStatus = currentStatus === 'aktif' ? 'suspend' : 'aktif';
+        setActionLoading(userId);
+        try {
+            await accountApi.updateUserStatus(userId, newStatus as 'aktif' | 'suspend');
+            toast.success(`User berhasil di${newStatus === 'suspend' ? 'suspend' : 'aktifkan'}`);
+            fetchUsers();
+        } catch (err: any) {
+            toast.error(err.response?.data?.message || 'Gagal update status');
+        } finally {
+            setActionLoading(null);
+        }
+    };
+
+    const filtered = users.filter(u =>
+        u.nama.toLowerCase().includes(search.toLowerCase()) ||
+        u.email.toLowerCase().includes(search.toLowerCase()) ||
+        u.accounts[0]?.nomor_rekening.includes(search)
+    );
+
+    if (loading) return <LoadingSpinner />;
+
+    return (
+        <div className="space-y-6">
+            <div className="flex items-center justify-between">
+                <div>
+                    <h2 className="text-2xl font-bold text-gray-900">Admin Panel</h2>
+                    <p className="text-gray-500 text-sm mt-1">
+                        Kelola semua akun nasabah — total {users.filter(u => u.role === 'nasabah').length} nasabah
+                    </p>
+                </div>
+                <div className="flex items-center gap-2 bg-orange-100 px-4 py-2 rounded-lg">
+                    <Users className="h-4 w-4 text-orange-600" />
+                    <span className="text-sm font-medium text-orange-700">Admin Mode</span>
+                </div>
+            </div>
+
+            {/* Stats */}
+            <div className="grid grid-cols-3 gap-4">
+                {[
+                    { label: 'Total Nasabah', value: users.filter(u => u.role === 'nasabah').length, color: 'blue' },
+                    { label: 'Akun Aktif', value: users.filter(u => u.status === 'aktif').length, color: 'green' },
+                    { label: 'Akun Suspend', value: users.filter(u => u.status === 'suspend').length, color: 'red' },
+                ].map(({ label, value, color }) => (
+                    <div key={label} className={`bg-${color}-50 border border-${color}-200 rounded-xl p-4`}>
+                        <p className={`text-2xl font-bold text-${color}-700`}>{value}</p>
+                        <p className={`text-sm text-${color}-600`}>{label}</p>
+                    </div>
+                ))}
+            </div>
+
+            {/* Search */}
+            <div className="relative">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" />
+                <input
+                    type="text"
+                    placeholder="Cari nama, email, atau nomor rekening..."
+                    value={search}
+                    onChange={e => setSearch(e.target.value)}
+                    className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+            </div>
+
+            {/* User Table */}
+            <Card>
+                <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                        <thead>
+                            <tr className="border-b border-gray-100 text-left">
+                                <th className="pb-3 font-semibold text-gray-600">Nasabah</th>
+                                <th className="pb-3 font-semibold text-gray-600">No. Rekening</th>
+                                <th className="pb-3 font-semibold text-gray-600">Saldo</th>
+                                <th className="pb-3 font-semibold text-gray-600">Status</th>
+                                <th className="pb-3 font-semibold text-gray-600">Aksi</th>
+                            </tr>
+                        </thead>
+                        <tbody className="divide-y divide-gray-50">
+                            {filtered.map((user) => (
+                                <tr key={user.id} className="hover:bg-gray-50">
+                                    <td className="py-3">
+                                        <p className="font-medium text-gray-900">{user.nama}</p>
+                                        <p className="text-xs text-gray-400">{user.email}</p>
+                                        <Badge variant={user.role === 'admin' ? 'warning' : 'info'}>
+                                            {user.role}
+                                        </Badge>
+                                    </td>
+                                    <td className="py-3">
+                                        <span className="font-mono text-xs text-gray-600">
+                                            {user.accounts[0]?.nomor_rekening || '-'}
+                                        </span>
+                                    </td>
+                                    <td className="py-3 font-medium">
+                                        {user.accounts[0] ? formatRupiah(user.accounts[0].saldo) : '-'}
+                                    </td>
+                                    <td className="py-3">
+                                        <Badge variant={user.status === 'aktif' ? 'success' : 'danger'}>
+                                            {user.status}
+                                        </Badge>
+                                    </td>
+                                    <td className="py-3">
+                                        {user.role !== 'admin' && (
+                                            <Button
+                                                size="sm"
+                                                variant={user.status === 'aktif' ? 'danger' : 'secondary'}
+                                                loading={actionLoading === user.id}
+                                                onClick={() => handleToggleStatus(user.id, user.status)}
+                                            >
+                                                {user.status === 'aktif' ? 'Suspend' : 'Aktifkan'}
+                                            </Button>
+                                        )}
+                                    </td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                    {filtered.length === 0 && (
+                        <p className="text-center text-gray-400 py-8">Tidak ada hasil untuk "{search}"</p>
+                    )}
+                </div>
+            </Card>
+        </div>
+    );
+};
+
+--- File: src/pages/RegisterPage.tsx ---
+
+import { useState } from 'react';
+import { useNavigate, Link } from 'react-router-dom';
+import { authApi } from '../api/auth.api';
+import { Button } from '../components/ui/Button';
+import { Input } from '../components/ui/Input';
+import toast from 'react-hot-toast';
+
+export const RegisterPage = () => {
+    const navigate = useNavigate();
+    const [loading, setLoading] = useState(false);
+    const [form, setForm] = useState({
+        nik: '', nama: '', email: '', nomor_hp: '', password: '',
+    });
+
+    const handleChange = (e: React.ChangeEvent<HTMLInputElement>) =>
+        setForm(prev => ({ ...prev, [e.target.name]: e.target.value }));
+
+    const handleSubmit = async (e: React.FormEvent) => {
+        e.preventDefault();
+        if (form.nik.length !== 16 || !/^\d+$/.test(form.nik)) {
+            toast.error('NIK harus tepat 16 digit angka');
+            return;
+        }
+        if (form.password.length < 8) {
+            toast.error('Password minimal 8 karakter');
+            return;
+        }
+        setLoading(true);
+        try {
+            const res = await authApi.register(form);
+            const { nomor_rekening } = res.data.data;
+            toast.success(`Registrasi berhasil! Nomor rekening kamu: ${nomor_rekening}`);
+            setTimeout(() => navigate('/login'), 2000);
+        } catch (err: any) {
+            toast.error(err.response?.data?.message || 'Registrasi gagal');
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    return (
+        <div className="min-h-screen bg-gradient-to-br from-slate-900 to-blue-900 flex items-center justify-center p-4">
+            <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-8">
+                <div className="text-center mb-8">
+                    <h1 className="text-2xl font-bold text-slate-900">Daftar Akun</h1>
+                    <p className="text-slate-500 text-sm mt-1">Bergabung dengan SecureBank</p>
+                </div>
+
+                <form onSubmit={handleSubmit} className="space-y-4">
+                    <Input
+                        label="NIK (16 digit)"
+                        name="nik"
+                        value={form.nik}
+                        onChange={handleChange}
+                        placeholder="3201234567890001"
+                        maxLength={16}
+                        required
+                    />
+                    <Input
+                        label="Nama Lengkap"
+                        name="nama"
+                        value={form.nama}
+                        onChange={handleChange}
+                        placeholder="Nama sesuai KTP"
+                        required
+                    />
+                    <Input
+                        label="Email"
+                        type="email"
+                        name="email"
+                        value={form.email}
+                        onChange={handleChange}
+                        placeholder="email@example.com"
+                        required
+                    />
+                    <Input
+                        label="Nomor HP (opsional)"
+                        name="nomor_hp"
+                        value={form.nomor_hp}
+                        onChange={handleChange}
+                        placeholder="081234567890"
+                    />
+                    <Input
+                        label="Password"
+                        type="password"
+                        name="password"
+                        value={form.password}
+                        onChange={handleChange}
+                        placeholder="Minimal 8 karakter"
+                        required
+                    />
+
+                    <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-xs text-blue-700">
+                        Saldo awal rekening: <strong>Rp 1.000.000</strong> (untuk keperluan testing)
+                    </div>
+
+                    <Button type="submit" loading={loading} className="w-full" size="lg">
+                        Daftar Sekarang
+                    </Button>
+                </form>
+
+                <p className="text-center text-sm text-gray-500 mt-6">
+                    Sudah punya akun?{' '}
+                    <Link to="/login" className="text-blue-600 hover:underline font-medium">
+                        Masuk di sini
+                    </Link>
+                </p>
+            </div>
+        </div>
+    );
+};
+
+--- File: src/pages/TransferPage.tsx ---
+
+import { useState } from 'react';
+import { transactionApi } from '../api/transaction.api';
+import { Card } from '../components/ui/Card';
+import { Button } from '../components/ui/Button';
+import { Input } from '../components/ui/Input';
+import { formatRupiah } from '../utils/format';
+import toast from 'react-hot-toast';
+import { CheckCircle, Copy } from 'lucide-react';
+
+type Step = 'form' | 'confirm' | 'success';
+
+interface TransferResult {
+    transaction_id: string;
+    nominal: number;
+    ke_rekening: string;
+    nama_penerima: string;
+    blockchain_hash: string;
+    waktu: string;
+}
+
+export const TransferPage = () => {
+    const [step, setStep] = useState<Step>('form');
+    const [loading, setLoading] = useState(false);
+    const [result, setResult] = useState<TransferResult | null>(null);
+    const [form, setForm] = useState({
+        nomor_rekening_tujuan: '',
+        nominal: '',
+        keterangan: '',
+    });
+
+    const handleChange = (e: React.ChangeEvent<HTMLInputElement>) =>
+        setForm(prev => ({ ...prev, [e.target.name]: e.target.value }));
+
+    const handleConfirm = (e: React.FormEvent) => {
+        e.preventDefault();
+        const num = parseInt(form.nominal);
+        if (isNaN(num) || num < 10000) {
+            toast.error('Nominal minimal Rp 10.000');
+            return;
+        }
+        if (num > 50000000) {
+            toast.error('Nominal maksimal Rp 50.000.000');
+            return;
+        }
+        setStep('confirm');
+    };
+
+    const handleTransfer = async () => {
+        setLoading(true);
+        try {
+            const res = await transactionApi.transfer({
+                nomor_rekening_tujuan: form.nomor_rekening_tujuan,
+                nominal: parseInt(form.nominal),
+                keterangan: form.keterangan || undefined,
+            });
+            setResult(res.data.data);
+            setStep('success');
+            toast.success('Transfer berhasil!');
+        } catch (err: any) {
+            toast.error(err.response?.data?.message || 'Transfer gagal');
+            setStep('form');
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const handleReset = () => {
+        setStep('form');
+        setResult(null);
+        setForm({ nomor_rekening_tujuan: '', nominal: '', keterangan: '' });
+    };
+
+    return (
+        <div className="max-w-lg mx-auto space-y-6">
+            <div>
+                <h2 className="text-2xl font-bold text-gray-900">Transfer Dana</h2>
+                <p className="text-gray-500 text-sm mt-1">
+                    Setiap transfer dicatat di blockchain sebagai bukti permanen
+                </p>
+            </div>
+
+            {step === 'form' && (
+                <Card>
+                    <form onSubmit={handleConfirm} className="space-y-4">
+                        <Input
+                            label="Nomor Rekening Tujuan"
+                            name="nomor_rekening_tujuan"
+                            value={form.nomor_rekening_tujuan}
+                            onChange={handleChange}
+                            placeholder="Contoh: 1000000003"
+                            required
+                        />
+                        <div>
+                            <label className="text-sm font-medium text-gray-700">Nominal (Rp)</label>
+                            <div className="relative mt-1">
+                                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm">Rp</span>
+                                <input
+                                    type="number"
+                                    name="nominal"
+                                    value={form.nominal}
+                                    onChange={handleChange}
+                                    placeholder="100000"
+                                    min={10000}
+                                    max={50000000}
+                                    className="w-full pl-10 pr-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                    required
+                                />
+                            </div>
+                            <p className="text-xs text-gray-400 mt-1">Min: Rp 10.000 — Max: Rp 50.000.000/transaksi</p>
+                        </div>
+                        <Input
+                            label="Keterangan (opsional)"
+                            name="keterangan"
+                            value={form.keterangan}
+                            onChange={handleChange}
+                            placeholder="Bayar utang, dll."
+                            maxLength={200}
+                        />
+                        <Button type="submit" className="w-full" size="lg">
+                            Lanjut ke Konfirmasi
+                        </Button>
+                    </form>
+                </Card>
+            )}
+
+            {step === 'confirm' && (
+                <Card title="Konfirmasi Transfer">
+                    <div className="space-y-3">
+                        <div className="flex justify-between text-sm">
+                            <span className="text-gray-500">Ke Rekening</span>
+                            <span className="font-medium font-mono">{form.nomor_rekening_tujuan}</span>
+                        </div>
+                        <div className="flex justify-between text-sm">
+                            <span className="text-gray-500">Nominal</span>
+                            <span className="font-semibold text-lg text-blue-600">
+                                {formatRupiah(parseInt(form.nominal))}
+                            </span>
+                        </div>
+                        {form.keterangan && (
+                            <div className="flex justify-between text-sm">
+                                <span className="text-gray-500">Keterangan</span>
+                                <span className="font-medium">{form.keterangan}</span>
+                            </div>
+                        )}
+                        <div className="border-t border-gray-100 pt-3">
+                            <p className="text-xs text-gray-400">
+                                Transaksi ini akan dicatat permanen di Hyperledger Besu blockchain.
+                            </p>
+                        </div>
+                    </div>
+                    <div className="flex gap-3 mt-6">
+                        <Button
+                            variant="secondary"
+                            className="flex-1"
+                            onClick={() => setStep('form')}
+                        >
+                            Kembali
+                        </Button>
+                        <Button
+                            className="flex-1"
+                            loading={loading}
+                            onClick={handleTransfer}
+                        >
+                            Konfirmasi & Transfer
+                        </Button>
+                    </div>
+                </Card>
+            )}
+
+            {step === 'success' && result && (
+                <Card>
+                    <div className="text-center space-y-4">
+                        <div className="flex justify-center">
+                            <CheckCircle className="h-16 w-16 text-green-500" />
+                        </div>
+                        <div>
+                            <h3 className="text-xl font-bold text-gray-900">Transfer Berhasil!</h3>
+                            <p className="text-gray-500 text-sm mt-1">
+                                {formatRupiah(result.nominal)} → {result.nama_penerima}
+                            </p>
+                        </div>
+
+                        {/* Blockchain proof */}
+                        <div className="bg-green-50 border border-green-200 rounded-lg p-4 text-left">
+                            <p className="text-xs font-semibold text-green-700 mb-1">
+                                🔗 Bukti Blockchain (SHA-256 Hash)
+                            </p>
+                            <div className="flex items-center gap-2">
+                                <p className="text-xs font-mono text-green-800 break-all flex-1">
+                                    {result.blockchain_hash}
+                                </p>
+                                <button
+                                    onClick={() => {
+                                        navigator.clipboard.writeText(result.blockchain_hash);
+                                        toast.success('Hash disalin!');
+                                    }}
+                                    className="shrink-0 p-1 hover:bg-green-100 rounded"
+                                >
+                                    <Copy className="h-3 w-3 text-green-600" />
+                                </button>
+                            </div>
+                        </div>
+
+                        <Button onClick={handleReset} className="w-full" size="lg">
+                            Transfer Lagi
+                        </Button>
+                    </div>
+                </Card>
+            )}
+        </div>
+    );
+};

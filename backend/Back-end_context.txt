@@ -1,0 +1,908 @@
+
+
+--- File: src/app.ts ---
+
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import { collectDefaultMetrics, register } from 'prom-client';
+
+import authRoutes from './modules/auth/auth.routes';
+import accountRoutes from './modules/account/account.routes';
+import transactionRoutes from './modules/transaction/transaction.routes';
+
+collectDefaultMetrics({ prefix: 'securebank_' });
+
+const app = express();
+
+app.use(helmet());
+app.use(cors({
+    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+    credentials: true,
+}));
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+app.get('/health', (_req, res) => {
+    res.json({ status: 'ok', service: 'SecureBank API', timestamp: new Date().toISOString() });
+});
+
+app.get('/metrics', async (_req, res) => {
+    res.set('Content-Type', register.contentType);
+    res.end(await register.metrics());
+});
+
+app.use('/api/v1/auth', authRoutes);
+app.use('/api/v1/accounts', accountRoutes);
+app.use('/api/v1/transactions', transactionRoutes);
+
+app.use((_req, res) => {
+    res.status(404).json({ success: false, message: 'Endpoint tidak ditemukan' });
+});
+
+app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    console.error('[Error]', err.stack);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`✅ SecureBank API berjalan di http://localhost:${PORT}`);
+    console.log(`📊 Metrics: http://localhost:${PORT}/metrics`);
+});
+
+export default app;
+
+--- File: src/modules/transaction/transaction.service.ts ---
+
+import prisma from '../../config/database';
+import { hashTransactionData } from '../../utils/crypto';
+import { sendTransferNotification } from '../../utils/email';
+import { createAuditLog } from '../../utils/auditLogger';
+import { getAccountByNomorRekening } from '../account/account.service';
+
+const DAILY_LIMIT = 50_000_000;
+
+export const transferService = async (
+    userId: string,
+    data: { nomor_rekening_tujuan: string; nominal: number; keterangan?: string },
+    ipAddress?: string
+) => {
+    const senderAccount = await prisma.account.findFirst({
+        where: { user_id: userId, status: 'aktif' },
+        include: { user: { select: { nama: true, email: true } } },
+    });
+    if (!senderAccount) throw new Error('Rekening pengirim tidak ditemukan');
+
+    const receiverAccount = await getAccountByNomorRekening(data.nomor_rekening_tujuan);
+    if (!receiverAccount) throw new Error('Nomor rekening tujuan tidak ditemukan');
+    if (receiverAccount.id === senderAccount.id)
+        throw new Error('Tidak bisa transfer ke rekening sendiri');
+    if (receiverAccount.status !== 'aktif')
+        throw new Error('Rekening tujuan tidak aktif');
+
+    if (Number(senderAccount.saldo) < data.nominal) {
+        await createAuditLog({
+            userId, aksi: `transfer_gagal_saldo:${data.nominal}`, ipAddress, hasil: 'gagal',
+        });
+        throw new Error('Saldo tidak mencukupi');
+    }
+
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const agg = await prisma.transaction.aggregate({
+        where: { dari_rekening: senderAccount.id, status: 'COMPLETED', waktu: { gte: todayStart } },
+        _sum: { nominal: true },
+    });
+    const todayUsed = Number(agg._sum.nominal ?? 0);
+    if (todayUsed + data.nominal > DAILY_LIMIT) {
+        const sisa = DAILY_LIMIT - todayUsed;
+        throw new Error(`Limit harian terlampaui. Sisa: Rp ${sisa.toLocaleString('id-ID')}`);
+    }
+
+    const txRecord = await prisma.$transaction(async (tx) => {
+        await tx.account.update({
+            where: { id: senderAccount.id },
+            data: { saldo: { decrement: data.nominal } },
+        });
+        await tx.account.update({
+            where: { id: receiverAccount.id },
+            data: { saldo: { increment: data.nominal } },
+        });
+        return tx.transaction.create({
+            data: {
+                dari_rekening: senderAccount.id,
+                ke_rekening: receiverAccount.id,
+                nominal: data.nominal,
+                status: 'PENDING',
+                keterangan: data.keterangan || null,
+            },
+        });
+    });
+
+    const blockchainHash = hashTransactionData({
+        transactionId: txRecord.id,
+        nominal: data.nominal.toString(),
+        dariRekening: senderAccount.id,
+        keRekening: receiverAccount.id,
+        waktu: txRecord.waktu.toISOString(),
+    });
+
+    await prisma.$transaction(async (tx) => {
+        await tx.transaction.update({
+            where: { id: txRecord.id },
+            data: { status: 'COMPLETED', blockchain_hash: blockchainHash },
+        });
+        await tx.blockchainRecord.create({
+            data: {
+                transaction_id: txRecord.id,
+                tx_hash: blockchainHash,
+                confirmed_at: new Date(),
+            },
+        });
+    });
+
+    await createAuditLog({
+        userId,
+        aksi: `transfer:${data.nominal}:ke:${receiverAccount.nomor_rekening}`,
+        ipAddress,
+        hasil: 'sukses',
+    });
+
+    sendTransferNotification(
+        senderAccount.user.email, senderAccount.user.nama,
+        'debit', data.nominal, blockchainHash, data.keterangan
+    ).catch((e) => console.error('[Email]', e));
+
+    sendTransferNotification(
+        receiverAccount.user.email, receiverAccount.user.nama,
+        'kredit', data.nominal, blockchainHash, data.keterangan
+    ).catch((e) => console.error('[Email]', e));
+
+    return {
+        transaction_id: txRecord.id,
+        nominal: data.nominal,
+        ke_rekening: receiverAccount.nomor_rekening,
+        nama_penerima: receiverAccount.user.nama,
+        status: 'COMPLETED',
+        blockchain_hash: blockchainHash,
+        waktu: txRecord.waktu,
+    };
+};
+
+export const getHistoryService = async (
+    userId: string, page = 1, limit = 10
+) => {
+    const account = await prisma.account.findFirst({
+        where: { user_id: userId, status: 'aktif' },
+    });
+    if (!account) throw new Error('Rekening tidak ditemukan');
+
+    const skip = (page - 1) * limit;
+    const where = {
+        OR: [{ dari_rekening: account.id }, { ke_rekening: account.id }],
+    };
+
+    const [transactions, total] = await Promise.all([
+        prisma.transaction.findMany({
+            where,
+            include: {
+                from_account: { include: { user: { select: { nama: true } } } },
+                to_account: { include: { user: { select: { nama: true } } } },
+                blockchain_record: true,
+            },
+            orderBy: { waktu: 'desc' },
+            skip,
+            take: limit,
+        }),
+        prisma.transaction.count({ where }),
+    ]);
+
+    return {
+        data: transactions.map((tx) => ({
+            id: tx.id,
+            tipe: tx.dari_rekening === account.id ? 'debit' : 'kredit',
+            nominal: tx.nominal,
+            status: tx.status,
+            keterangan: tx.keterangan,
+            nama_pengirim: tx.from_account.user.nama,
+            nomor_rekening_pengirim: tx.from_account.nomor_rekening,
+            nama_penerima: tx.to_account.user.nama,
+            nomor_rekening_penerima: tx.to_account.nomor_rekening,
+            blockchain_hash: tx.blockchain_hash,
+            blockchain_confirmed: tx.blockchain_record?.confirmed_at ?? null,
+            waktu: tx.waktu,
+        })),
+        pagination: { page, limit, total, total_pages: Math.ceil(total / limit) },
+    };
+};
+
+--- File: src/modules/transaction/transaction.routes.ts ---
+
+import { Router } from 'express';
+import { transfer, getHistory } from './transaction.controller';
+import { authenticateToken } from '../../middleware/auth.middleware';
+import { generalLimiter } from '../../middleware/rateLimiter.middleware';
+
+const router = Router();
+router.use(authenticateToken);
+router.post('/transfer', generalLimiter, transfer);
+router.get('/history', getHistory);
+export default router;
+
+--- File: src/modules/transaction/transaction.validator.ts ---
+
+import Joi from 'joi';
+
+export const transferSchema = Joi.object({
+    nomor_rekening_tujuan: Joi.string().required()
+        .messages({ 'any.required': 'Nomor rekening tujuan wajib diisi' }),
+    nominal: Joi.number().integer().positive().min(10000).max(50000000).required()
+        .messages({
+            'number.min': 'Nominal minimal Rp 10.000',
+            'number.max': 'Nominal maksimal Rp 50.000.000',
+        }),
+    keterangan: Joi.string().max(200).optional().allow(''),
+});
+
+--- File: src/modules/transaction/transaction.controller.ts ---
+
+import { Request, Response } from 'express';
+import { transferSchema } from './transaction.validator';
+import { transferService, getHistoryService } from './transaction.service';
+
+export const transfer = async (req: Request, res: Response): Promise<void> => {
+    const { error, value } = transferSchema.validate(req.body, { abortEarly: false });
+    if (error) {
+        res.status(400).json({
+            success: false,
+            message: error.details.map((d) => d.message).join('; '),
+        });
+        return;
+    }
+    try {
+        const data = await transferService(req.user!.userId, value, req.ip);
+        res.json({ success: true, message: 'Transfer berhasil', data });
+    } catch (err) {
+        res.status(400).json({ success: false, message: (err as Error).message });
+    }
+};
+
+export const getHistory = async (req: Request, res: Response): Promise<void> => {
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string) || 10));
+    try {
+        const data = await getHistoryService(req.user!.userId, page, limit);
+        res.json({ success: true, data });
+    } catch (err) {
+        res.status(400).json({ success: false, message: (err as Error).message });
+    }
+};
+
+
+--- File: src/modules/account/account.controller.ts ---
+
+import { Request, Response } from 'express';
+import {
+    getMyAccountService, getAllUsersService, updateUserStatusService,
+} from './account.service';
+import { createAuditLog } from '../../utils/auditLogger';
+
+export const getMyAccount = async (req: Request, res: Response): Promise<void> => {
+    try {
+        const data = await getMyAccountService(req.user!.userId);
+        res.json({ success: true, data });
+    } catch (err) {
+        res.status(404).json({ success: false, message: (err as Error).message });
+    }
+};
+
+export const getAllUsers = async (_req: Request, res: Response): Promise<void> => {
+    try {
+        const data = await getAllUsersService();
+        res.json({ success: true, data });
+    } catch {
+        res.status(500).json({ success: false, message: 'Gagal mengambil data' });
+    }
+};
+
+export const updateUserStatus = async (req: Request, res: Response): Promise<void> => {
+    const { userId } = req.params;
+    const { status } = req.body;
+    if (!['aktif', 'suspend'].includes(status)) {
+        res.status(400).json({ success: false, message: 'Status tidak valid' });
+        return;
+    }
+    try {
+        const updated = await updateUserStatusService(userId, status);
+        await createAuditLog({
+            userId: req.user!.userId,
+            aksi: `admin_${status}_user:${userId}`,
+            ipAddress: req.ip,
+            hasil: 'sukses',
+        });
+        res.json({
+            success: true,
+            message: `User ${updated.nama} berhasil di${status === 'suspend' ? 'suspend' : 'aktifkan'}`,
+            data: updated,
+        });
+    } catch (err) {
+        res.status(400).json({ success: false, message: (err as Error).message });
+    }
+};
+
+--- File: src/modules/account/account.routes.ts ---
+
+import { Router } from 'express';
+import { getMyAccount, getAllUsers, updateUserStatus } from './account.controller';
+import { authenticateToken } from '../../middleware/auth.middleware';
+import { requireRole } from '../../middleware/rbac.middleware';
+
+const router = Router();
+router.get('/me', authenticateToken, getMyAccount);
+router.get('/admin/users', authenticateToken, requireRole('admin'), getAllUsers);
+router.patch('/admin/users/:userId/status', authenticateToken, requireRole('admin'), updateUserStatus);
+export default router;
+
+--- File: src/modules/account/account.service.ts ---
+
+import prisma from '../../config/database';
+
+export const getMyAccountService = async (userId: string) => {
+    const account = await prisma.account.findFirst({
+        where: { user_id: userId, status: 'aktif' },
+        include: { user: { select: { nama: true, email: true, role: true } } },
+    });
+    if (!account) throw new Error('Rekening tidak ditemukan');
+    return {
+        id: account.id,
+        nomor_rekening: account.nomor_rekening,
+        saldo: account.saldo,
+        tipe_akun: account.tipe_akun,
+        status: account.status,
+        nama: account.user.nama,
+        email: account.user.email,
+        role: account.user.role,
+        created_at: account.created_at,
+    };
+};
+
+export const getAccountByNomorRekening = async (nomor_rekening: string) => {
+    return prisma.account.findUnique({
+        where: { nomor_rekening },
+        include: { user: { select: { nama: true, email: true } } },
+    });
+};
+
+export const getAllUsersService = async () => {
+    return prisma.user.findMany({
+        select: {
+            id: true, nik: true, nama: true, email: true,
+            nomor_hp: true, role: true, status: true, created_at: true,
+            accounts: { select: { nomor_rekening: true, saldo: true, status: true } },
+        },
+        orderBy: { created_at: 'desc' },
+    });
+};
+
+export const updateUserStatusService = async (
+    userId: string, status: 'aktif' | 'suspend'
+) => {
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    if (!user) throw new Error('User tidak ditemukan');
+    if (user.role === 'admin') throw new Error('Tidak bisa suspend akun admin');
+    return prisma.user.update({
+        where: { id: userId },
+        data: { status },
+        select: { id: true, nama: true, status: true },
+    });
+};
+
+--- File: src/modules/auth/auth.controller.ts ---
+
+import { Request, Response } from 'express';
+import * as v from './auth.validator';
+import * as s from './auth.service';
+
+export const register = async (req: Request, res: Response): Promise<void> => {
+    const { error, value } = v.registerSchema.validate(req.body, { abortEarly: false });
+    if (error) {
+        res.status(400).json({
+            success: false,
+            message: error.details.map((d) => d.message).join('; '),
+        });
+        return;
+    }
+    try {
+        const data = await s.registerService(value);
+        res.status(201).json({ success: true, message: 'Registrasi berhasil', data });
+    } catch (err) {
+        res.status(400).json({ success: false, message: (err as Error).message });
+    }
+};
+
+export const login = async (req: Request, res: Response): Promise<void> => {
+    const { error, value } = v.loginSchema.validate(req.body);
+    if (error) {
+        res.status(400).json({ success: false, message: error.details[0].message });
+        return;
+    }
+    try {
+        const result = await s.loginService(value.email, value.password, req.ip);
+        res.json({ success: true, ...result });
+    } catch (err) {
+        res.status(401).json({ success: false, message: (err as Error).message });
+    }
+};
+
+export const verifyOtp = async (req: Request, res: Response): Promise<void> => {
+    const { error, value } = v.verifyOtpSchema.validate(req.body);
+    if (error) {
+        res.status(400).json({ success: false, message: error.details[0].message });
+        return;
+    }
+    try {
+        const data = await s.verifyOtpService(value.email, value.otp, req.ip);
+        res.json({ success: true, message: 'Login berhasil', data });
+    } catch (err) {
+        res.status(401).json({ success: false, message: (err as Error).message });
+    }
+};
+
+--- File: src/modules/auth/auth.routes.ts ---
+
+import { Router } from 'express';
+import { register, login, verifyOtp } from './auth.controller';
+import { loginLimiter, otpLimiter } from '../../middleware/rateLimiter.middleware';
+
+const router = Router();
+router.post('/register', register);
+router.post('/login', loginLimiter, login);
+router.post('/verify-otp', otpLimiter, verifyOtp);
+export default router;
+
+--- File: src/modules/auth/auth.validator.ts ---
+
+import Joi from 'joi';
+
+export const registerSchema = Joi.object({
+    nik: Joi.string().length(16).pattern(/^\d+$/).required()
+        .messages({
+            'string.length': 'NIK harus 16 digit',
+            'string.pattern.base': 'NIK hanya boleh angka',
+        }),
+    nama: Joi.string().min(3).max(100).required(),
+    email: Joi.string().email().required(),
+    nomor_hp: Joi.string().min(10).max(15).pattern(/^\d+$/).optional().allow(''),
+    password: Joi.string().min(8).max(100).required()
+        .messages({ 'string.min': 'Password minimal 8 karakter' }),
+});
+
+export const loginSchema = Joi.object({
+    email: Joi.string().email().required(),
+    password: Joi.string().required(),
+});
+
+export const verifyOtpSchema = Joi.object({
+    email: Joi.string().email().required(),
+    otp: Joi.string().length(6).pattern(/^\d+$/).required()
+        .messages({ 'string.length': 'OTP harus 6 digit' }),
+});
+
+--- File: src/modules/auth/auth.service.ts ---
+
+import bcrypt from 'bcryptjs';
+import prisma from '../../config/database';
+import redis from '../../config/redis';
+import { generateOTP, generateAccountNumber, hashOTP } from '../../utils/crypto';
+import { generateAccessToken, generateRefreshToken } from '../../utils/jwt';
+import { sendOTPEmail } from '../../utils/email';
+import { createAuditLog } from '../../utils/auditLogger';
+
+const OTP_TTL = 5 * 60;
+const OTP_MAX_ATTEMPTS = 3;
+
+export const registerService = async (data: {
+    nik: string; nama: string; email: string;
+    nomor_hp?: string; password: string;
+}) => {
+    const [emailExists, nikExists] = await Promise.all([
+        prisma.user.findUnique({ where: { email: data.email } }),
+        prisma.user.findUnique({ where: { nik: data.nik } }),
+    ]);
+    if (emailExists) throw new Error('Email sudah terdaftar');
+    if (nikExists) throw new Error('NIK sudah terdaftar');
+
+    const password_hash = await bcrypt.hash(data.password, 12);
+
+    let nomor_rekening = generateAccountNumber();
+    while (await prisma.account.findUnique({ where: { nomor_rekening } })) {
+        nomor_rekening = generateAccountNumber();
+    }
+
+    const result = await prisma.$transaction(async (tx) => {
+        const user = await tx.user.create({
+            data: {
+                nik: data.nik, nama: data.nama, email: data.email,
+                nomor_hp: data.nomor_hp || null, password_hash,
+            },
+        });
+        const account = await tx.account.create({
+            data: { user_id: user.id, nomor_rekening, saldo: 1000000 },
+        });
+        return { user, account };
+    });
+
+    await createAuditLog({ userId: result.user.id, aksi: 'register', hasil: 'sukses' });
+
+    return {
+        id: result.user.id,
+        nama: result.user.nama,
+        email: result.user.email,
+        nomor_rekening: result.account.nomor_rekening,
+    };
+};
+
+export const loginService = async (
+    email: string, password: string, ipAddress?: string
+) => {
+    const user = await prisma.user.findUnique({ where: { email } });
+
+    if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+        await createAuditLog({
+            aksi: `login_gagal:${email}`, ipAddress, hasil: 'gagal',
+        });
+        throw new Error('Email atau password salah');
+    }
+
+    if (user.status === 'suspend')
+        throw new Error('Akun kamu telah disuspend. Hubungi admin.');
+
+    const otp = generateOTP();
+    const otpHash = hashOTP(otp);
+    await redis.setex(`otp:${email}`, OTP_TTL, `${otpHash}:0`);
+    await sendOTPEmail(email, user.nama, otp);
+
+    await createAuditLog({
+        userId: user.id, aksi: 'login_otp_dikirim', ipAddress, hasil: 'sukses',
+    });
+
+    return { message: 'Kode OTP telah dikirim ke email kamu. Berlaku 5 menit.' };
+};
+
+export const verifyOtpService = async (
+    email: string, otp: string, ipAddress?: string
+) => {
+    const stored = await redis.get(`otp:${email}`);
+    if (!stored) throw new Error('OTP expired. Silakan login ulang.');
+
+    const [storedHash, attemptsStr] = stored.split(':');
+    const attempts = parseInt(attemptsStr, 10);
+
+    if (attempts >= OTP_MAX_ATTEMPTS) {
+        await redis.del(`otp:${email}`);
+        throw new Error('Percobaan OTP habis. Silakan login ulang dari awal.');
+    }
+
+    if (hashOTP(otp) !== storedHash) {
+        const remaining = OTP_MAX_ATTEMPTS - attempts - 1;
+        const ttl = await redis.ttl(`otp:${email}`);
+        if (ttl > 0) await redis.setex(`otp:${email}`, ttl, `${storedHash}:${attempts + 1}`);
+        throw new Error(
+            remaining > 0 ? `OTP salah. Sisa percobaan: ${remaining}` : 'OTP salah. Percobaan habis.'
+        );
+    }
+
+    await redis.del(`otp:${email}`);
+
+    const user = await prisma.user.findUnique({
+        where: { email },
+        include: {
+            accounts: {
+                where: { status: 'aktif' },
+                select: { id: true, nomor_rekening: true, saldo: true },
+            },
+        },
+    });
+    if (!user) throw new Error('User tidak ditemukan');
+
+    const tokenPayload = { userId: user.id, email: user.email, role: user.role };
+
+    await createAuditLog({
+        userId: user.id, aksi: 'login_sukses', ipAddress, hasil: 'sukses',
+    });
+
+    return {
+        accessToken: generateAccessToken(tokenPayload),
+        refreshToken: generateRefreshToken(tokenPayload),
+        user: {
+            id: user.id, nama: user.nama,
+            email: user.email, role: user.role,
+            accounts: user.accounts,
+        },
+    };
+};
+
+--- File: src/utils/email.ts ---
+
+import nodemailer from 'nodemailer';
+
+const transporter = nodemailer.createTransport({
+    host: process.env.EMAIL_HOST || 'smtp.gmail.com',
+    port: parseInt(process.env.EMAIL_PORT || '587'),
+    secure: false,
+    auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS,
+    },
+});
+
+export const sendOTPEmail = async (
+    email: string,
+    nama: string,
+    otp: string
+): Promise<void> => {
+    await transporter.sendMail({
+        from: process.env.EMAIL_FROM,
+        to: email,
+        subject: 'Kode OTP Login SecureBank',
+        html: `
+      <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:20px">
+        <h2 style="color:#1B3A6B">SecureBank</h2>
+        <hr/>
+        <p>Halo <strong>${nama}</strong>,</p>
+        <p>Kode OTP login kamu:</p>
+        <div style="background:#EFF6FF;border:2px solid #2563EB;padding:24px;
+                    text-align:center;border-radius:8px;margin:20px 0">
+          <span style="font-size:40px;font-weight:bold;letter-spacing:12px;
+                       color:#1B3A6B;font-family:monospace">${otp}</span>
+        </div>
+        <p>Berlaku <strong>5 menit</strong> dan hanya bisa digunakan <strong>sekali</strong>.</p>
+        <p style="color:#991B1B;font-size:13px">
+          ⚠️ Jangan bagikan kode ini kepada siapapun.
+        </p>
+      </div>
+    `,
+    });
+};
+
+export const sendTransferNotification = async (
+    email: string,
+    nama: string,
+    type: 'debit' | 'kredit',
+    nominal: number,
+    txHash: string,
+    keterangan?: string
+): Promise<void> => {
+    const isDebit = type === 'debit';
+    const fmt = new Intl.NumberFormat('id-ID', {
+        style: 'currency', currency: 'IDR',
+    }).format(nominal);
+
+    await transporter.sendMail({
+        from: process.env.EMAIL_FROM,
+        to: email,
+        subject: `[SecureBank] ${isDebit ? 'Transfer Keluar' : 'Transfer Masuk'} ${fmt}`,
+        html: `
+      <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:20px">
+        <h2 style="color:#1B3A6B">SecureBank</h2>
+        <hr/>
+        <p>Halo <strong>${nama}</strong>, transaksi berikut berhasil diproses:</p>
+        <table style="width:100%;border-collapse:collapse;font-size:14px">
+          <tr><td style="padding:8px;border:1px solid #E2E8F0;font-weight:bold">Jenis</td>
+              <td style="padding:8px;border:1px solid #E2E8F0">${isDebit ? '🔴 Transfer Keluar' : '🟢 Transfer Masuk'}</td></tr>
+          <tr><td style="padding:8px;border:1px solid #E2E8F0;font-weight:bold">Nominal</td>
+              <td style="padding:8px;border:1px solid #E2E8F0">${fmt}</td></tr>
+          ${keterangan ? `<tr><td style="padding:8px;border:1px solid #E2E8F0;font-weight:bold">Keterangan</td>
+              <td style="padding:8px;border:1px solid #E2E8F0">${keterangan}</td></tr>` : ''}
+          <tr><td style="padding:8px;border:1px solid #E2E8F0;font-weight:bold">Bukti Blockchain</td>
+              <td style="padding:8px;border:1px solid #E2E8F0;font-family:monospace;font-size:11px;word-break:break-all">${txHash}</td></tr>
+        </table>
+      </div>
+    `,
+    });
+};
+
+--- File: src/utils/auditLogger.ts ---
+
+import prisma from '../config/database';
+
+interface AuditLogData {
+    userId?: string;
+    aksi: string;
+    ipAddress?: string;
+    hasil: 'sukses' | 'gagal';
+}
+
+export const createAuditLog = async (data: AuditLogData): Promise<void> => {
+    try {
+        await prisma.auditLog.create({
+            data: {
+                user_id: data.userId ?? null,
+                aksi: data.aksi.slice(0, 100),
+                ip_address: data.ipAddress ?? null,
+                hasil: data.hasil,
+            },
+        });
+    } catch (err) {
+        console.error('[AuditLog Error]', err);
+    }
+};
+
+--- File: src/utils/jwt.ts ---
+
+import jwt from 'jsonwebtoken';
+import fs from 'fs';
+import path from 'path';
+
+const getPrivateKey = () =>
+    fs.readFileSync(path.resolve(process.env.JWT_PRIVATE_KEY_PATH || './keys/private.key'));
+
+const getPublicKey = () =>
+    fs.readFileSync(path.resolve(process.env.JWT_PUBLIC_KEY_PATH || './keys/public.key'));
+
+export interface JwtPayload {
+    userId: string;
+    email: string;
+    role: string;
+    type: 'access' | 'refresh';
+    iat?: number;
+    exp?: number;
+}
+
+export const generateAccessToken = (
+    payload: Omit<JwtPayload, 'type' | 'iat' | 'exp'>
+): string =>
+    jwt.sign({ ...payload, type: 'access' }, getPrivateKey(), {
+        algorithm: 'RS256',
+        expiresIn: (process.env.JWT_ACCESS_EXPIRES as jwt.SignOptions['expiresIn']) || '15m',
+    });
+
+export const generateRefreshToken = (
+    payload: Omit<JwtPayload, 'type' | 'iat' | 'exp'>
+): string =>
+    jwt.sign({ ...payload, type: 'refresh' }, getPrivateKey(), {
+        algorithm: 'RS256',
+        expiresIn: (process.env.JWT_REFRESH_EXPIRES as jwt.SignOptions['expiresIn']) || '7d',
+    });
+
+export const verifyToken = (token: string): JwtPayload =>
+    jwt.verify(token, getPublicKey(), { algorithms: ['RS256'] }) as JwtPayload;
+
+--- File: src/utils/crypto.ts ---
+
+import crypto from 'crypto';
+
+export const generateOTP = (): string =>
+    Math.floor(100000 + Math.random() * 900000).toString();
+
+export const generateAccountNumber = (): string => {
+    const timestamp = Date.now().toString().slice(-8);
+    const random = Math.floor(10 + Math.random() * 90).toString();
+    return `1${timestamp}${random}`;
+};
+
+export const hashTransactionData = (data: {
+    transactionId: string;
+    nominal: string;
+    dariRekening: string;
+    keRekening: string;
+    waktu: string;
+}): string =>
+    '0x' + crypto.createHash('sha256').update(JSON.stringify(data)).digest('hex');
+
+export const hashOTP = (otp: string): string =>
+    crypto
+        .createHmac('sha256', process.env.OTP_SECRET || 'default-secret')
+        .update(otp)
+        .digest('hex');
+
+--- File: src/middleware/rateLimiter.middleware.ts ---
+
+import rateLimit from 'express-rate-limit';
+
+export const loginLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 5,
+    message: { success: false, message: 'Terlalu banyak percobaan login. Tunggu 1 menit.' },
+});
+
+export const otpLimiter = rateLimit({
+    windowMs: 5 * 60 * 1000,
+    max: 3,
+    message: { success: false, message: 'Terlalu banyak percobaan OTP. Tunggu 5 menit.' },
+});
+
+export const generalLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 100,
+    message: { success: false, message: 'Terlalu banyak request.' },
+});
+
+--- File: src/middleware/auth.middleware.ts ---
+
+import { Request, Response, NextFunction } from 'express';
+import { verifyToken, JwtPayload } from '../utils/jwt';
+
+declare global {
+    namespace Express {
+        interface Request {
+            user?: JwtPayload;
+        }
+    }
+}
+
+export const authenticateToken = (
+    req: Request,
+    res: Response,
+    next: NextFunction
+): void => {
+    const token = req.headers.authorization?.startsWith('Bearer ')
+        ? req.headers.authorization.slice(7)
+        : null;
+
+    if (!token) {
+        res.status(401).json({ success: false, message: 'Token tidak ditemukan. Silakan login.' });
+        return;
+    }
+
+    try {
+        const payload = verifyToken(token);
+        if (payload.type !== 'access') {
+            res.status(401).json({ success: false, message: 'Token tidak valid' });
+            return;
+        }
+        req.user = payload;
+        next();
+    } catch {
+        res.status(401).json({ success: false, message: 'Token expired. Silakan login ulang.' });
+    }
+};
+
+--- File: src/middleware/rbac.middleware.ts ---
+
+import { Request, Response, NextFunction } from 'express';
+
+export const requireRole = (...roles: string[]) =>
+    (req: Request, res: Response, next: NextFunction): void => {
+        if (!req.user) {
+            res.status(401).json({ success: false, message: 'Tidak terautentikasi' });
+            return;
+        }
+        if (!roles.includes(req.user.role)) {
+            res.status(403).json({
+                success: false,
+                message: `Akses ditolak. Hanya untuk: ${roles.join(', ')}`,
+            });
+            return;
+        }
+        next();
+    };
+
+--- File: src/config/database.ts ---
+
+import { PrismaClient } from '@prisma/client';
+
+const prisma = new PrismaClient({
+    log: process.env.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'],
+});
+
+export default prisma;
+
+--- File: src/config/redis.ts ---
+
+import Redis from 'ioredis';
+
+const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
+    maxRetriesPerRequest: 3,
+    retryStrategy: (times) => {
+        if (times > 3) return null;
+        return Math.min(times * 200, 3000);
+    },
+});
+
+redis.on('connect', () => console.log('✅ Redis terhubung'));
+redis.on('error', (err) => console.error('❌ Redis error:', err.message));
+
+export default redis;
