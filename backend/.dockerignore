@@ -1,0 +1,8 @@
+node_modules/
+dist/
+keys/
+.env
+*.md
+.git
+coverage/
+*.log

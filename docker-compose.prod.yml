@@ -74,6 +74,7 @@ services:
       - EMAIL_FROM=${EMAIL_FROM}
       - PORT=3000
       - FRONTEND_URL=http://localhost
+      - PRISMA_CLI_BINARY_TARGETS=linux-musl-openssl-3.0.x
     depends_on:
       postgres:
         condition: service_healthy
