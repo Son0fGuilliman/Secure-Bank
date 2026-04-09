@@ -91,22 +91,26 @@ pipeline {
         }
 
         stage('5. SAST - SonarCloud Scan') {
-            steps {
-                echo '=== Stage 5: Static Application Security Testing ==='
-                withSonarQubeEnv('SonarCloud') {
-                    sh '''
-                        sonar-scanner \
-                          -Dsonar.projectKey=Son0fGuilliman_Secure-Bank \
-                          -Dsonar.organization=son0fguilliman \
-                          -Dsonar.projectName="SecureBank DevSecOps" \
-                          -Dsonar.sources=backend/src,frontend/src \
-                          -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/*.test.ts \
-                          -Dsonar.host.url=${SONAR_HOST_URL}
-                    '''
-                }
-                echo 'SonarCloud scan selesai - cek hasil di sonarcloud.io'
+    steps {
+        echo '=== Stage 5: Static Application Security Testing ==='
+        withSonarQubeEnv('SonarCloud') {
+            script {
+                // Ambil path sonar-scanner dari Jenkins Tools
+                def scannerHome = tool 'SonarScanner'
+                sh """
+                    ${scannerHome}/bin/sonar-scanner \
+                      -Dsonar.projectKey=Son0fGuilliman_Secure-Bank \
+                      -Dsonar.organization=son0fguilliman \
+                      -Dsonar.projectName="SecureBank DevSecOps" \
+                      -Dsonar.sources=backend/src,frontend/src \
+                      -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/*.test.ts \
+                      -Dsonar.host.url=https://sonarcloud.io
+                """
             }
         }
+        echo 'SonarCloud scan selesai - cek hasil di sonarcloud.io'
+    }
+}
 
         stage('6. Build Docker Images') {
             parallel {
