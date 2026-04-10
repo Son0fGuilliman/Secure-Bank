@@ -173,37 +173,44 @@ ENVEOF
 }
 
 stage('8. DAST - OWASP ZAP') {
-    steps {
-        echo '=== Stage 8: Dynamic Application Security Testing ==='
-        sh '''
-            mkdir -p zap-reports
+            steps {
+                echo '=== Stage 8: Dynamic Application Security Testing ==='
+                sh '''
+                    mkdir -p zap-reports
 
-            # Nama network sudah pasti: nama folder workspace + nama network di compose
-            # Workspace folder: securebank-pipeline, network: app-network
-            NETWORK_NAME="securebank-pipeline_app-network"
+                    NETWORK_NAME="securebank-pipeline_app-network"
+                    echo "Menggunakan network: ${NETWORK_NAME}"
+                    echo "Target: http://securebank-backend:3000"
 
-            echo "Menggunakan network: ${NETWORK_NAME}"
-            echo "Target: http://securebank-backend:3000"
+                    # 1. Bersihkan container zap-scanner jika ada sisa dari run sebelumnya
+                    docker rm -f zap-scanner 2>/dev/null || true
 
-            # ZAP join ke network yang sama dengan backend
-            # Gunakan nama container sebagai hostname (Docker DNS)
-            docker run --rm \
-                --network ${NETWORK_NAME} \
-                -v $(pwd)/zap-reports:/zap/wrk/:rw \
-                --user root \
-                ghcr.io/zaproxy/zaproxy:stable \
-                zap-baseline.py \
-                -t http://securebank-backend:3000 \
-                -r zap-report.html \
-                -J zap-report.json \
-                -l WARN \
-                -I 2>&1 | tee zap-reports/zap-output.txt || true
+                    # 2. Jalankan ZAP TANPA --rm dan TANPA -v (Volume Mount)
+                    # Beri nama spesifik: --name zap-scanner
+                    docker run --name zap-scanner \
+                        --network ${NETWORK_NAME} \
+                        --user root \
+                        ghcr.io/zaproxy/zaproxy:stable \
+                        zap-baseline.py \
+                        -t http://securebank-backend:3000 \
+                        -r zap-report.html \
+                        -J zap-report.json \
+                        -l WARN \
+                        -I 2>&1 | tee zap-reports/zap-output.txt || true
 
-            echo "DAST scan selesai"
-            ls -la zap-reports/
-        '''
-    }
-}
+                    # 3. Ekstrak laporan secara manual dari dalam container ZAP ke workspace Jenkins
+                    echo "Mengekstrak laporan ZAP..."
+                    docker cp zap-scanner:/zap/wrk/zap-report.json zap-reports/zap-report.json || echo "JSON report gagal disalin"
+                    docker cp zap-scanner:/zap/wrk/zap-report.html zap-reports/zap-report.html || echo "HTML report gagal disalin"
+
+                    # 4. Hapus container ZAP setelah laporan berhasil diekstrak
+                    docker rm -f zap-scanner
+
+                    echo "DAST scan selesai"
+                    ls -la zap-reports/
+                '''
+            }
+        }
 
         stage('9. Security Gate') {
             steps {
