@@ -167,8 +167,7 @@ ENVEOF
             sleep 15
 
             # Health check backend langsung ke port 3000
-            curl -f http://localhost:3000/health && echo "Backend staging: OK" || echo "Backend staging: WARNING - lanjut"
-
+docker exec securebank-backend wget -qO- http://localhost:3000/health && echo "Backend staging: OK" || echo "Backend staging: WARNING"
             # Jalankan frontend + nginx
             docker-compose -f docker-compose.prod.yml --env-file .env.prod up -d frontend nginx
             sleep 10
@@ -190,7 +189,7 @@ stage('8. DAST - OWASP ZAP') {
 
             # Scan langsung ke backend (lebih reliable dari nginx)
             docker run --rm \
-                --network host \
+               --network securebank-pipeline_app-network \
                 -v $(pwd)/zap-reports:/zap/wrk/:rw \
                 --user root \
                 ghcr.io/zaproxy/zaproxy:stable \
