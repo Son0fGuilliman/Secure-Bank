@@ -173,40 +173,32 @@ ENVEOF
 }
 
 stage('8. DAST - OWASP ZAP') {
-    steps {
-        echo '=== Stage 8: Dynamic Application Security Testing ==='
-        sh '''
-            mkdir -p zap-reports
-
-            # Dapatkan nama network yang dipakai backend
-            BACKEND_NETWORK=$(docker inspect securebank-backend \
-                --format "{{range \$k, \$v := .NetworkSettings.Networks}}{{\$k}}{{end}}" \
-                | awk "{print \$1}")
-            echo "Backend network: $BACKEND_NETWORK"
-
-            # Dapatkan IP backend di dalam networknya
-            BACKEND_IP=$(docker inspect securebank-backend \
-                --format "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}")
-            echo "Backend IP: $BACKEND_IP"
-
-            # Jalankan ZAP di network yang sama dengan backend
-            docker run --rm \
-                --network ${BACKEND_NETWORK} \
-                -v $(pwd)/zap-reports:/zap/wrk/:rw \
-                --user root \
-                ghcr.io/zaproxy/zaproxy:stable \
-                zap-baseline.py \
-                -t http://${BACKEND_IP}:3000 \
-                -r zap-report.html \
-                -J zap-report.json \
-                -l WARN \
-                -I 2>&1 | tee zap-reports/zap-output.txt || true
-
-            echo "DAST scan selesai"
-            ls -la zap-reports/
-        '''
-    }
-}
+            steps {
+                echo '=== Stage 8: Dynamic Application Security Testing ==='
+                sh '''
+                    mkdir -p zap-reports
+                    
+                    echo "Menunggu backend siap untuk ZAP..."
+                    sleep 10
+                    
+                    # Jalankan ZAP menggunakan DNS Internal Docker
+                    docker run --rm \
+                        --network securebank-pipeline_app-network \
+                        -v $(pwd)/zap-reports:/zap/wrk/:rw \
+                        --user root \
+                        ghcr.io/zaproxy/zaproxy:stable \
+                        zap-baseline.py \
+                        -t http://securebank-backend:3000 \
+                        -r zap-report.html \
+                        -J zap-report.json \
+                        -l WARN \
+                        -I 2>&1 | tee zap-reports/zap-output.txt || true
+                    
+                    echo "DAST scan selesai"
+                    ls -la zap-reports/
+                '''
+            }
+        }
 
         stage('9. Security Gate') {
             steps {
