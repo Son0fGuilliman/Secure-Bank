@@ -129,15 +129,25 @@ pipeline {
             }
         }
 
-        stage('7. Deploy Staging') {
-            steps {
-                echo '=== Stage 7: Deploy ke Staging ==='
-                sh '''
-                    # Stop jika masih running
-                    docker compose -f docker-compose.prod.yml down --remove-orphans 2>/dev/null || true
+stage('7. Deploy Staging') {
+    steps {
+        echo '=== Stage 7: Deploy ke Staging ==='
+        sh '''
+            # Install docker-compose jika belum ada
+            if ! command -v docker-compose &> /dev/null; then
+                curl -SL https://github.com/docker/compose/releases/download/v2.24.0/docker-compose-linux-x86_64 \
+                    -o /usr/local/bin/docker-compose
+                chmod +x /usr/local/bin/docker-compose
+            fi
 
-                    # Buat .env untuk production dari environment Jenkins
-                    cat > .env.prod << ENVEOF
+            # Verifikasi versi
+            docker-compose version
+
+            # Stop staging jika masih running
+            docker-compose -f docker-compose.prod.yml down --remove-orphans 2>/dev/null || true
+
+            # Buat .env untuk production
+            cat > .env.prod << ENVEOF
 OTP_SECRET=securebank-otp-secret-2024
 EMAIL_HOST=smtp.gmail.com
 EMAIL_PORT=587
@@ -146,52 +156,51 @@ EMAIL_PASS=placeholder
 EMAIL_FROM=SecureBank <placeholder@gmail.com>
 ENVEOF
 
-                    # Jalankan staging
-                    docker compose -f docker-compose.prod.yml --env-file .env.prod up -d postgres redis
-                    
-                    echo "Menunggu database siap..."
-                    sleep 20
-                    
-                    # Jalankan backend
-                    docker compose -f docker-compose.prod.yml --env-file .env.prod up -d backend
-                    sleep 15
-                    
-                    # Health check backend
-                    curl -f http://localhost:3000/health && echo "Backend staging: OK" || echo "Backend staging: WARNING"
-                    
-                    # Jalankan frontend + nginx
-                    docker compose -f docker-compose.prod.yml --env-file .env.prod up -d frontend nginx
-                    sleep 10
-                    
-                    echo "Staging deploy selesai"
-                '''
-            }
-        }
+            # Jalankan database dulu
+            docker-compose -f docker-compose.prod.yml --env-file .env.prod up -d postgres redis
+            echo "Menunggu database siap..."
+            sleep 20
 
-        stage('8. DAST - OWASP ZAP') {
-            steps {
-                echo '=== Stage 8: Dynamic Application Security Testing ==='
-                sh '''
-                    mkdir -p zap-reports
-                    
-                    # Jalankan ZAP Baseline Scan
-                    docker run --rm \
-                        --network host \
-                        -v $(pwd)/zap-reports:/zap/wrk/:rw \
-                        --user root \
-                        ghcr.io/zaproxy/zaproxy:stable \
-                        zap-baseline.py \
-                        -t http://localhost/health \
-                        -r zap-report.html \
-                        -J zap-report.json \
-                        -l WARN \
-                        -I 2>&1 | tee zap-reports/zap-output.txt || true
-                    
-                    echo "DAST scan selesai"
-                    ls -la zap-reports/
-                '''
-            }
-        }
+            # Jalankan backend
+            docker-compose -f docker-compose.prod.yml --env-file .env.prod up -d backend
+            echo "Menunggu backend siap..."
+            sleep 15
+
+            # Health check backend langsung ke port 3000
+            curl -f http://localhost:3000/health && echo "Backend staging: OK" || echo "Backend staging: WARNING - lanjut"
+
+            # Jalankan frontend + nginx
+            docker-compose -f docker-compose.prod.yml --env-file .env.prod up -d frontend nginx
+            sleep 10
+
+            echo "Staging deploy selesai"
+            docker-compose -f docker-compose.prod.yml ps
+        '''
+    }
+}
+       stage('8. DAST - OWASP ZAP') {
+    steps {
+        echo '=== Stage 8: Dynamic Application Security Testing ==='
+        sh '''
+            mkdir -p zap-reports
+
+            docker run --rm \
+                --network host \
+                -v $(pwd)/zap-reports:/zap/wrk/:rw \
+                --user root \
+                ghcr.io/zaproxy/zaproxy:stable \
+                zap-baseline.py \
+                -t http://localhost/health \
+                -r zap-report.html \
+                -J zap-report.json \
+                -l WARN \
+                -I 2>&1 | tee zap-reports/zap-output.txt || true
+
+            echo "DAST scan selesai"
+            ls -la zap-reports/
+        '''
+    }
+}
 
         stage('9. Security Gate') {
             steps {
@@ -239,25 +248,24 @@ else:
 
     }
 
-    post {
-        always {
-            echo '=== Mengarsipkan laporan ==='
-            archiveArtifacts(
-                artifacts: 'zap-reports/**,audit-*.txt',
-                allowEmptyArchive: true
-            )
-        }
-        success {
-            echo '✅ PIPELINE BERHASIL - Semua 9 stage lulus!'
-            echo 'Cek hasil SonarCloud di: https://sonarcloud.io'
-            echo 'Cek laporan ZAP di Jenkins Artifacts'
-        }
-        failure {
-            echo '❌ PIPELINE GAGAL - Cek log di atas untuk detail'
-            sh 'docker compose -f docker-compose.prod.yml down 2>/dev/null || true'
-        }
-        cleanup {
-            sh 'rm -f .env.prod'
-        }
+ post {
+    always {
+        echo '=== Mengarsipkan laporan ==='
+        archiveArtifacts(
+            artifacts: 'zap-reports/**,audit-*.txt',
+            allowEmptyArchive: true
+        )
     }
+    success {
+        echo '✅ PIPELINE BERHASIL - Semua 9 stage lulus!'
+        echo 'Cek hasil SonarCloud di: https://sonarcloud.io'
+    }
+    failure {
+        echo '❌ PIPELINE GAGAL - Cek log di atas untuk detail'
+        sh 'docker-compose -f docker-compose.prod.yml down 2>/dev/null || true'
+    }
+    cleanup {
+        sh 'rm -f .env.prod'
+    }
+}
 }
