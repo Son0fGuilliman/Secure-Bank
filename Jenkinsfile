@@ -133,20 +133,14 @@ stage('7. Deploy Staging') {
     steps {
         echo '=== Stage 7: Deploy ke Staging ==='
         sh '''
-            # Install docker-compose jika belum ada
             if ! command -v docker-compose &> /dev/null; then
                 curl -SL https://github.com/docker/compose/releases/download/v2.24.0/docker-compose-linux-x86_64 \
                     -o /usr/local/bin/docker-compose
                 chmod +x /usr/local/bin/docker-compose
             fi
 
-            # Verifikasi versi
-            docker-compose version
-
-            # Stop staging jika masih running
             docker-compose -f docker-compose.prod.yml down --remove-orphans 2>/dev/null || true
 
-            # Buat .env untuk production
             cat > .env.prod << ENVEOF
 OTP_SECRET=securebank-otp-secret-2024
 EMAIL_HOST=smtp.gmail.com
@@ -156,20 +150,19 @@ EMAIL_PASS=placeholder
 EMAIL_FROM=SecureBank <placeholder@gmail.com>
 ENVEOF
 
-            # Jalankan database dulu
             docker-compose -f docker-compose.prod.yml --env-file .env.prod up -d postgres redis
             echo "Menunggu database siap..."
             sleep 20
 
-            # Jalankan backend
             docker-compose -f docker-compose.prod.yml --env-file .env.prod up -d backend
             echo "Menunggu backend siap..."
             sleep 15
 
-            # Health check backend langsung ke port 3000
-            curl -f http://localhost:3000/health && echo "Backend staging: OK" || echo "Backend staging: WARNING - lanjut"
+            # Cek health langsung via docker exec (tidak bergantung network)
+            docker exec securebank-backend wget -qO- http://localhost:3000/health \
+                && echo "Backend staging: OK" \
+                || echo "Backend staging: WARNING - lanjut"
 
-            # Jalankan frontend + nginx
             docker-compose -f docker-compose.prod.yml --env-file .env.prod up -d frontend nginx
             sleep 10
 
@@ -178,24 +171,32 @@ ENVEOF
         '''
     }
 }
+
 stage('8. DAST - OWASP ZAP') {
     steps {
         echo '=== Stage 8: Dynamic Application Security Testing ==='
         sh '''
             mkdir -p zap-reports
 
-            # Tunggu backend benar-benar siap
-            echo "Menunggu backend untuk ZAP..."
-            sleep 10
+            # Dapatkan nama network yang dipakai backend
+            BACKEND_NETWORK=$(docker inspect securebank-backend \
+                --format "{{range \$k, \$v := .NetworkSettings.Networks}}{{\$k}}{{end}}" \
+                | awk "{print \$1}")
+            echo "Backend network: $BACKEND_NETWORK"
 
-            # Scan langsung ke backend (lebih reliable dari nginx)
+            # Dapatkan IP backend di dalam networknya
+            BACKEND_IP=$(docker inspect securebank-backend \
+                --format "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}")
+            echo "Backend IP: $BACKEND_IP"
+
+            # Jalankan ZAP di network yang sama dengan backend
             docker run --rm \
-                --network host \
+                --network ${BACKEND_NETWORK} \
                 -v $(pwd)/zap-reports:/zap/wrk/:rw \
                 --user root \
                 ghcr.io/zaproxy/zaproxy:stable \
                 zap-baseline.py \
-                -t http://localhost:3000 \
+                -t http://${BACKEND_IP}:3000 \
                 -r zap-report.html \
                 -J zap-report.json \
                 -l WARN \
