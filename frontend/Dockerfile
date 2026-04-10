@@ -7,45 +7,24 @@ COPY package*.json ./
 RUN npm ci
 
 COPY . .
-
-# Build untuk production (Vite akan minify dan bundle)
 RUN npm run build
 
 # ── Stage 2: Serve dengan Nginx ───────────────────
 FROM nginx:alpine AS production
 
+# Install curl untuk healthcheck
+RUN apk add --no-cache curl
+
 # Hapus config nginx default
 RUN rm /etc/nginx/conf.d/default.conf
 
-# Copy config nginx kita
+# Copy hasil build React
 COPY --from=builder /app/dist /usr/share/nginx/html
 
-# Config nginx untuk React SPA (handle client-side routing)
-RUN cat > /etc/nginx/conf.d/default.conf << 'EOF'
-server {
-    listen 80;
-    server_name _;
-    root /usr/share/nginx/html;
-    index index.html;
-
-    # Gzip compression
-    gzip on;
-    gzip_types text/plain text/css application/json application/javascript;
-
-    # Handle React client-side routing
-    location / {
-        try_files $uri $uri/ /index.html;
-    }
-
-    # Cache static assets
-    location ~* \.(js|css|png|jpg|svg|ico|woff2)$ {
-        expires 1y;
-        add_header Cache-Control "public, immutable";
-    }
-}
-EOF
+# Copy nginx config dari file terpisah
+COPY nginx.conf /etc/nginx/conf.d/default.conf
 
 EXPOSE 80
 
-HEALTHCHECK --interval=30s --timeout=10s \
-  CMD wget -qO- http://localhost:80 || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+  CMD curl -f http://localhost:80 || exit 1
