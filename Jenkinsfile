@@ -173,32 +173,37 @@ ENVEOF
 }
 
 stage('8. DAST - OWASP ZAP') {
-            steps {
-                echo '=== Stage 8: Dynamic Application Security Testing ==='
-                sh '''
-                    mkdir -p zap-reports
-                    
-                    echo "Menunggu backend siap untuk ZAP..."
-                    sleep 10
-                    
-                    # Jalankan ZAP menggunakan DNS Internal Docker
-                    docker run --rm \
-                        --network securebank-pipeline_app-network \
-                        -v $(pwd)/zap-reports:/zap/wrk/:rw \
-                        --user root \
-                        ghcr.io/zaproxy/zaproxy:stable \
-                        zap-baseline.py \
-                        -t http://securebank-backend:3000 \
-                        -r zap-report.html \
-                        -J zap-report.json \
-                        -l WARN \
-                        -I 2>&1 | tee zap-reports/zap-output.txt || true
-                    
-                    echo "DAST scan selesai"
-                    ls -la zap-reports/
-                '''
-            }
-        }
+    steps {
+        echo '=== Stage 8: Dynamic Application Security Testing ==='
+        sh '''
+            mkdir -p zap-reports
+
+            # Nama network sudah pasti: nama folder workspace + nama network di compose
+            # Workspace folder: securebank-pipeline, network: app-network
+            NETWORK_NAME="securebank-pipeline_app-network"
+
+            echo "Menggunakan network: ${NETWORK_NAME}"
+            echo "Target: http://securebank-backend:3000"
+
+            # ZAP join ke network yang sama dengan backend
+            # Gunakan nama container sebagai hostname (Docker DNS)
+            docker run --rm \
+                --network ${NETWORK_NAME} \
+                -v $(pwd)/zap-reports:/zap/wrk/:rw \
+                --user root \
+                ghcr.io/zaproxy/zaproxy:stable \
+                zap-baseline.py \
+                -t http://securebank-backend:3000 \
+                -r zap-report.html \
+                -J zap-report.json \
+                -l WARN \
+                -I 2>&1 | tee zap-reports/zap-output.txt || true
+
+            echo "DAST scan selesai"
+            ls -la zap-reports/
+        '''
+    }
+}
 
         stage('9. Security Gate') {
             steps {
