@@ -178,19 +178,24 @@ ENVEOF
         '''
     }
 }
-       stage('8. DAST - OWASP ZAP') {
+stage('8. DAST - OWASP ZAP') {
     steps {
         echo '=== Stage 8: Dynamic Application Security Testing ==='
         sh '''
             mkdir -p zap-reports
 
+            # Tunggu backend benar-benar siap
+            echo "Menunggu backend untuk ZAP..."
+            sleep 10
+
+            # Scan langsung ke backend (lebih reliable dari nginx)
             docker run --rm \
                 --network host \
                 -v $(pwd)/zap-reports:/zap/wrk/:rw \
                 --user root \
                 ghcr.io/zaproxy/zaproxy:stable \
                 zap-baseline.py \
-                -t http://localhost/health \
+                -t http://localhost:3000 \
                 -r zap-report.html \
                 -J zap-report.json \
                 -l WARN \

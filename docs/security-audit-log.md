@@ -52,3 +52,15 @@
 Kedua vulnerability ini ditemukan secara otomatis oleh pipeline Jenkins CI/CD
 pada Stage 3 (Dependency Audit / SCA). Ini membuktikan bahwa pipeline
 DevSecOps berfungsi sebagai automated security gate.
+
+## Tanggal: 10 April 2026 — Ditemukan via Jenkins Pipeline Build #7
+
+### Vulnerability: Axios CRITICAL
+- **Package:** axios < 1.15.0
+- **Severity:** CRITICAL
+- **CVE:** GHSA-3p68-rc4w-qgx5
+- **Deskripsi:** SSRF via NO_PROXY Hostname Normalization Bypass — penyerang bisa bypass proxy restriction dan melakukan Server-Side Request Forgery
+- **Dampak:** Frontend bisa diarahkan untuk menghubungi internal services yang seharusnya tidak bisa diakses dari luar
+- **Hubungan Threat Model:** Threat #14 (Penyadapan) — SSRF memungkinkan data bocor ke server penyerang
+- **Fix:** npm install axios@latest
+- **Status:** ✅ Fixed
