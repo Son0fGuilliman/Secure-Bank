@@ -183,11 +183,11 @@ stage('8. DAST - OWASP ZAP') {
             echo "Menggunakan network: ${NETWORK_NAME}"
             echo "Target: http://securebank-backend:3000"
 
-            # Gunakan path absolut /zap/wrk/ untuk report
-            # sehingga file tersimpan di volume yang di-mount
-            docker run --rm \
+            # Menghindari issue Docker-out-of-Docker saat mount volume (path mismatch)
+            # dengan menggunakan docker cp untuk mengekstrak report
+            docker rm zap-scan >/dev/null 2>&1 || true
+            docker run --name zap-scan \
                 --network ${NETWORK_NAME} \
-                -v $(pwd)/zap-reports:/zap/wrk/:rw \
                 --user root \
                 ghcr.io/zaproxy/zaproxy:stable \
                 zap-baseline.py \
@@ -196,6 +196,10 @@ stage('8. DAST - OWASP ZAP') {
                 -J zap-report.json \
                 -l WARN \
                 -I 2>&1 | tee zap-reports/zap-output.txt || true
+                
+            docker cp zap-scan:/zap/wrk/zap-report.html zap-reports/zap-report.html || echo "HTML report missing"
+            docker cp zap-scan:/zap/wrk/zap-report.json zap-reports/zap-report.json || echo "JSON report missing"
+            docker rm zap-scan || true
 
             echo "DAST scan selesai"
             ls -la zap-reports/
