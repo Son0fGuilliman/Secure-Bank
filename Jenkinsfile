@@ -192,8 +192,8 @@ stage('8. DAST - OWASP ZAP') {
                 ghcr.io/zaproxy/zaproxy:stable \
                 zap-baseline.py \
                 -t http://securebank-backend:3000 \
-                -r /zap/wrk/zap-report.html \
-                -J /zap/wrk/zap-report.json \
+                -r zap-report.html \
+                -J zap-report.json \
                 -l WARN \
                 -I 2>&1 | tee zap-reports/zap-output.txt || true
 
