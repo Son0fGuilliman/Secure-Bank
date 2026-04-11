@@ -231,25 +231,27 @@ stage('8. DAST - OWASP ZAP') {
                     echo "--- Hasil OWASP ZAP ---"
                     if [ -f zap-reports/zap-report.json ]; then
                         echo "ZAP report tersedia"
-                        python3 -c "
-import json
-with open('zap-reports/zap-report.json') as f:
-    data = json.load(f)
-sites = data.get('site', [])
-total_high = 0
-total_medium = 0
-for site in sites:
-    for alert in site.get('alerts', []):
-        risk = alert.get('riskcode', '0')
-        if risk == '3': total_high += 1
-        elif risk == '2': total_medium += 1
-print(f'HIGH alerts: {total_high}')
-print(f'MEDIUM alerts: {total_medium}')
-if total_high > 0:
-    print('WARNING: Ada HIGH severity alerts - review manual diperlukan')
-else:
-    print('Security gate: PASSED')
-" || echo "Security gate check selesai"
+                        node -e "
+const fs = require('fs');
+const data = JSON.parse(fs.readFileSync('zap-reports/zap-report.json', 'utf8'));
+const sites = data.site || [];
+let total_high = 0;
+let total_medium = 0;
+sites.forEach(site => {
+    (site.alerts || []).forEach(alert => {
+        if (alert.riskcode === '3') total_high++;
+        else if (alert.riskcode === '2') total_medium++;
+    });
+});
+console.log('HIGH alerts: ' + total_high);
+console.log('MEDIUM alerts: ' + total_medium);
+if (total_high > 0) {
+    console.log('WARNING: Ada HIGH severity alerts - review manual diperlukan');
+    process.exit(1);
+} else {
+    console.log('Security gate: PASSED');
+}
+" || echo "Security gate check selesai namun terdapat isu risk atau script error"
                     else
                         echo "ZAP report tidak ditemukan - skip gate check"
                     fi
