@@ -12,6 +12,9 @@ collectDefaultMetrics({ prefix: 'securebank_' });
 
 const app = express();
 
+// Railway menggunakan reverse proxy — wajib agar rate-limiter & req.ip benar
+app.set('trust proxy', 1);
+
 app.use(helmet());
 app.use(cors({
     origin: process.env.FRONTEND_URL || 'http://localhost:5173',

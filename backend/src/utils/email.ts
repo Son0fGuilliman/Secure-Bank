@@ -1,4 +1,8 @@
+import dns from 'dns';
 import nodemailer from 'nodemailer';
+
+// Railway tidak support IPv6 — paksa DNS resolve ke IPv4
+dns.setDefaultResultOrder('ipv4first');
 
 const transporter = nodemailer.createTransport({
     host: process.env.EMAIL_HOST || 'smtp.gmail.com',
