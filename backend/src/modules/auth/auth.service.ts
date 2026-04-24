@@ -68,7 +68,16 @@ export const loginService = async (
     const otp = generateOTP();
     const otpHash = hashOTP(otp);
     await redis.setex(`otp:${email}`, OTP_TTL, `${otpHash}:0`);
-    await sendOTPEmail(email, user.nama, otp);
+
+    // Kirim email OTP — jangan sampai hang request jika SMTP bermasalah
+    try {
+        await sendOTPEmail(email, user.nama, otp);
+        console.log(`✅ OTP email sent to ${email}`);
+    } catch (emailErr) {
+        console.error(`❌ Gagal kirim OTP email ke ${email}:`, (emailErr as Error).message);
+        // OTP sudah tersimpan di Redis, user tetap bisa cek email (jika terkirim sebagian)
+        // Jangan throw — biarkan response tetap terkirim
+    }
 
     await createAuditLog({
         userId: user.id, aksi: 'login_otp_dikirim', ipAddress, hasil: 'sukses',

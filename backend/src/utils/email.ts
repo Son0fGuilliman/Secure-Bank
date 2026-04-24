@@ -8,7 +8,13 @@ const transporter = nodemailer.createTransport({
         user: process.env.EMAIL_USER,
         pass: process.env.EMAIL_PASS,
     },
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 10_000,
 });
+
+// Log email config on startup (tanpa credentials)
+console.log(`📧 Email transport: ${process.env.EMAIL_HOST || 'smtp.gmail.com'}:${process.env.EMAIL_PORT || '587'} (secure=${process.env.EMAIL_PORT === '465'})`);
 
 export const sendOTPEmail = async (
     email: string,
