@@ -1,30 +1,57 @@
 import dns from 'dns';
 import nodemailer from 'nodemailer';
+import type Mail from 'nodemailer/lib/mailer';
 
-// Railway tidak support IPv6 — paksa DNS resolve ke IPv4
-dns.setDefaultResultOrder('ipv4first');
+// ─── Lazy-initialized transporter (resolve IPv4 secara eksplisit) ───
+let cachedTransporter: nodemailer.Transporter | null = null;
 
-const transporter = nodemailer.createTransport({
-    host: process.env.EMAIL_HOST || 'smtp.gmail.com',
-    port: parseInt(process.env.EMAIL_PORT || '587'),
-    secure: process.env.EMAIL_PORT === '465',
-    auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS,
-    },
-    connectionTimeout: 10_000,
-    greetingTimeout: 10_000,
-    socketTimeout: 10_000,
-});
+async function getTransporter(): Promise<nodemailer.Transporter> {
+    if (cachedTransporter) return cachedTransporter;
 
-// Log email config on startup (tanpa credentials)
-console.log(`📧 Email transport: ${process.env.EMAIL_HOST || 'smtp.gmail.com'}:${process.env.EMAIL_PORT || '587'} (secure=${process.env.EMAIL_PORT === '465'})`);
+    const host = process.env.EMAIL_HOST || 'smtp.gmail.com';
+    const port = parseInt(process.env.EMAIL_PORT || '587');
+    const secure = port === 465;
+
+    // Resolve hostname ke IPv4 secara eksplisit
+    // Alpine Linux (musl) mengabaikan dns-result-order, jadi kita harus manual
+    let resolvedHost = host;
+    try {
+        const addresses = await dns.promises.resolve4(host);
+        if (addresses.length > 0) {
+            resolvedHost = addresses[0];
+            console.log(`📧 Resolved ${host} → IPv4: ${resolvedHost}`);
+        }
+    } catch (err) {
+        console.warn(`⚠️ IPv4 resolve gagal untuk ${host}, pakai hostname langsung`);
+    }
+
+    cachedTransporter = nodemailer.createTransport({
+        host: resolvedHost,
+        port,
+        secure,
+        auth: {
+            user: process.env.EMAIL_USER,
+            pass: process.env.EMAIL_PASS,
+        },
+        tls: {
+            // Wajib: TLS verifikasi tetap pakai hostname asli, bukan IP
+            servername: host,
+        },
+        connectionTimeout: 10_000,
+        greetingTimeout: 10_000,
+        socketTimeout: 10_000,
+    });
+
+    console.log(`📧 Email transport ready: ${resolvedHost}:${port} (secure=${secure})`);
+    return cachedTransporter;
+}
 
 export const sendOTPEmail = async (
     email: string,
     nama: string,
     otp: string
 ): Promise<void> => {
+    const transporter = await getTransporter();
     await transporter.sendMail({
         from: process.env.EMAIL_FROM,
         to: email,
@@ -57,6 +84,7 @@ export const sendTransferNotification = async (
     txHash: string,
     keterangan?: string
 ): Promise<void> => {
+    const transporter = await getTransporter();
     const isDebit = type === 'debit';
     const fmt = new Intl.NumberFormat('id-ID', {
         style: 'currency', currency: 'IDR',
