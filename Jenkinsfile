@@ -133,13 +133,7 @@ stage('7. Deploy Staging') {
     steps {
         echo '=== Stage 7: Deploy ke Staging ==='
         sh '''
-            if ! command -v docker-compose &> /dev/null; then
-                curl -SL https://github.com/docker/compose/releases/download/v2.24.0/docker-compose-linux-x86_64 \
-                    -o /usr/local/bin/docker-compose
-                chmod +x /usr/local/bin/docker-compose
-            fi
-
-            docker-compose -f docker-compose.prod.yml down --remove-orphans 2>/dev/null || true
+            docker compose -f docker-compose.prod.yml down --remove-orphans 2>/dev/null || true
 
             cat > .env.prod << ENVEOF
 OTP_SECRET=securebank-otp-secret-2024
@@ -150,11 +144,11 @@ EMAIL_PASS=placeholder
 EMAIL_FROM=SecureBank <placeholder@gmail.com>
 ENVEOF
 
-            docker-compose -f docker-compose.prod.yml --env-file .env.prod up -d postgres redis
+            docker compose -f docker-compose.prod.yml --env-file .env.prod up -d postgres redis
             echo "Menunggu database siap..."
             sleep 20
 
-            docker-compose -f docker-compose.prod.yml --env-file .env.prod up -d backend
+            docker compose -f docker-compose.prod.yml --env-file .env.prod up -d backend
             echo "Menunggu backend siap..."
             sleep 15
 
@@ -163,11 +157,11 @@ ENVEOF
                 && echo "Backend staging: OK" \
                 || echo "Backend staging: WARNING - lanjut"
 
-            docker-compose -f docker-compose.prod.yml --env-file .env.prod up -d frontend nginx
+            docker compose -f docker-compose.prod.yml --env-file .env.prod up -d frontend nginx
             sleep 10
 
             echo "Staging deploy selesai"
-            docker-compose -f docker-compose.prod.yml ps
+            docker compose -f docker-compose.prod.yml ps
         '''
     }
 }
@@ -275,7 +269,7 @@ if (total_high > 0) {
     }
     failure {
         echo '❌ PIPELINE GAGAL - Cek log di atas untuk detail'
-        sh 'docker-compose -f docker-compose.prod.yml down 2>/dev/null || true'
+        sh 'docker compose -f docker-compose.prod.yml down 2>/dev/null || true'
     }
     cleanup {
         sh 'rm -f .env.prod'

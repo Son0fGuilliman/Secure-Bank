@@ -27,6 +27,8 @@ services:
       # Mount Docker socket agar Jenkins bisa jalankan Docker
       - /var/run/docker.sock:/var/run/docker.sock
       - /usr/bin/docker:/usr/bin/docker
+      # Mount Docker CLI plugins (docker compose, buildx, etc.)
+      - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
     
     networks:
       - ci-network
