@@ -21,6 +21,7 @@ volumes:
   redis_data:
   prometheus_data:
   grafana_data:
+  besu_data:
 
 # ── SERVICES ──────────────────────────────────────
 services:
@@ -118,6 +119,27 @@ services:
     restart: unless-stopped
 
   # ── BLOCKCHAIN SERVER ────────────────────────────
+  hyperledger-besu:
+    image: hyperledger/besu:latest
+    container_name: securebank-besu
+    command: >
+      --network=dev
+      --miner-enabled
+      --miner-coinbase=0xfe3b557e8fb62b89f4916b721be55ceb828dbd73
+      --rpc-http-enabled
+      --host-allowlist=*
+      --rpc-http-cors-origins=all
+      --data-path=/opt/besu/data
+    volumes:
+      - besu_data:/opt/besu/data
+    ports:
+      - "8545:8545" # HTTP RPC
+      - "8546:8546" # WebSocket RPC
+    networks:
+      - blockchain-network
+      - app-network
+    restart: unless-stopped
+
   prometheus:
     image: prom/prometheus:latest
     container_name: securebank-prometheus
@@ -147,4 +169,5 @@ services:
       - prometheus
     networks:
       - blockchain-network
+      - app-network       
     restart: unless-stopped
